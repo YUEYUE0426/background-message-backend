@@ -1,0 +1,12 @@
+name = "background-message-backend"
+main = "src/index.js"
+compatibility_date = "2026-10-05"
+
+[durable_objects]
+bindings = [
+  { name = "BACKGROUND_BACKEND", class_name = "BackgroundBackend" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["BackgroundBackend"]
