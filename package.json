@@ -1,0 +1,15 @@
+{
+  "name": "background-message-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@mmmike/web-push": "^1.3.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
