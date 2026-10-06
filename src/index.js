@@ -609,6 +609,197 @@ async function sendToAll(
   return valid;
 }
 
+function createSetupPage() {
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>后台消息服务设置</title>
+<style>
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 24px;
+  line-height: 1.6;
+  background: #f6f7f9;
+  color: #222;
+}
+.card {
+  background: #fff;
+  border-radius: 16px;
+  padding: 20px;
+  margin: 16px 0;
+  box-shadow: 0 2px 12px #0000000d;
+}
+h1 { font-size: 24px; }
+h2 { font-size: 18px; }
+button {
+  border: 0;
+  border-radius: 10px;
+  padding: 12px 18px;
+  font-size: 15px;
+  cursor: pointer;
+  background: #1677ff;
+  color: #fff;
+}
+label {
+  display: block;
+  font-weight: 600;
+  margin-top: 14px;
+}
+textarea,
+input {
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 6px;
+  padding: 10px;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  font: 14px monospace;
+}
+textarea {
+  min-height: 80px;
+  resize: vertical;
+}
+.note {
+  color: #666;
+  font-size: 14px;
+}
+.warning {
+  background: #fff4e5;
+  padding: 12px;
+  border-radius: 10px;
+  color: #8a5300;
+}
+</style>
+</head>
+
+<body>
+<h1>后台消息服务设置</h1>
+
+<div class="card">
+  <h2>生成 Web Push 密钥</h2>
+
+  <p>
+    点击下面的按钮，在当前浏览器本地生成一组 VAPID 密钥。
+  </p>
+
+  <p class="warning">
+    私钥只在当前浏览器中生成，不会上传到此服务器。
+    请妥善保存私钥。
+  </p>
+
+  <button id="generate">
+    生成 VAPID 密钥
+  </button>
+</div>
+
+<div class="card">
+  <label>VAPID_PUBLIC_KEY</label>
+  <textarea id="publicKey" readonly></textarea>
+
+  <label>VAPID_PRIVATE_KEY</label>
+  <textarea id="privateKey" readonly></textarea>
+
+  <label>VAPID_SUBJECT</label>
+  <input
+    id="subject"
+    value="mailto:your-email@example.com"
+  >
+
+  <p class="note">
+    将这三个值分别添加到 Cloudflare Worker 的
+    Settings → Variables and Secrets。
+  </p>
+
+  <p class="note">
+    VAPID_PUBLIC_KEY 使用普通 Variable；
+    VAPID_PRIVATE_KEY 使用 Secret；
+    VAPID_SUBJECT 使用普通 Variable。
+  </p>
+</div>
+
+<script>
+function base64url(bytes) {
+  let binary = '';
+
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+
+  return btoa(binary)
+    .replace(/\\+/g, '-')
+    .replace(/\\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+function concatBytes(a, b) {
+  const result = new Uint8Array(
+    a.length + b.length
+  );
+
+  result.set(a, 0);
+  result.set(b, a.length);
+
+  return result;
+}
+
+document.getElementById('generate').onclick = async () => {
+  try {
+    const pair =
+      await crypto.subtle.generateKey(
+        {
+          name: 'ECDSA',
+          namedCurve: 'P-256'
+        },
+        true,
+        ['sign', 'verify']
+      );
+
+    const publicKey =
+      new Uint8Array(
+        await crypto.subtle.exportKey(
+          'raw',
+          pair.publicKey
+        )
+      );
+
+    const privateJwk =
+      await crypto.subtle.exportKey(
+        'jwk',
+        pair.privateKey
+      );
+
+    if (!privateJwk.d) {
+      throw new Error('无法读取私钥');
+    }
+
+    document.getElementById(
+      'publicKey'
+    ).value = base64url(publicKey);
+
+    document.getElementById(
+      'privateKey'
+    ).value = privateJwk.d;
+
+    document.getElementById(
+      'generate'
+    ).textContent = '已生成，可重新生成';
+
+  } catch (error) {
+    alert(
+      '生成失败：' + error.message
+    );
+  }
+};
+</script>
+
+</body>
+</html>`;
+}
+
 export default {
   async fetch(request, env) {
     if (
@@ -617,6 +808,25 @@ export default {
       return new Response('', {
         headers: CORS
       });
+    }
+
+    const url =
+      new URL(request.url);
+
+    if (
+      url.pathname === '/setup' &&
+      request.method === 'GET'
+    ) {
+      return new Response(
+        createSetupPage(),
+        {
+          headers: {
+            'Content-Type':
+              'text/html; charset=UTF-8',
+            ...CORS
+          }
+        }
+      );
     }
 
     if (
@@ -630,9 +840,6 @@ export default {
         401
       );
     }
-
-    const url =
-      new URL(request.url);
 
     if (
       url.pathname ===
