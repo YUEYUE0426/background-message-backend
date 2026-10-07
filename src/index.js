@@ -683,7 +683,8 @@ textarea {
   <h2>生成 Web Push 密钥</h2>
 
   <p>
-    点击下面的按钮，在当前浏览器本地生成一组 VAPID 密钥。
+    第一步：点击下面的按钮，在当前浏览器本地生成一组 VAPID 密钥。
+    <strong>此步骤不需要填写邮箱。</strong>
   </p>
 
   <p class="warning">
@@ -703,21 +704,21 @@ textarea {
   <label>VAPID_PRIVATE_KEY</label>
   <textarea id="privateKey" readonly></textarea>
 
-  <label>VAPID_SUBJECT</label>
-  <input
-    id="subject"
-    value="mailto:your-email@example.com"
-  >
-
   <p class="note">
-    将这三个值分别添加到 Cloudflare Worker 的
-    Settings → Variables and Secrets。
+    <strong>注意：</strong>生成 VAPID 密钥不需要填写邮箱。
+    点击上面的按钮生成密钥后，再到 Cloudflare Worker 的
+    Settings → Variables and Secrets 中单独填写 VAPID_SUBJECT。
   </p>
 
   <p class="note">
     VAPID_PUBLIC_KEY 使用普通 Variable；
     VAPID_PRIVATE_KEY 使用 Secret；
     VAPID_SUBJECT 使用普通 Variable。
+  </p>
+
+  <p class="note">
+    VAPID_SUBJECT 示例：
+    <code>mailto:your-email@example.com</code>
   </p>
 </div>
 
