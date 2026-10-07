@@ -47,9 +47,10 @@ export class BackgroundBackend {
   }
 
   async fetch(request) {
-    const url = new URL(request.url);
+    try {
+      const url = new URL(request.url);
 
-    if (
+      if (
       url.pathname === '/v1/push/register' &&
       request.method === 'POST'
     ) {
@@ -303,12 +304,21 @@ export class BackgroundBackend {
       });
     }
 
-    return json(
-      {
-        error: 'Not found'
-      },
-      404
-    );
+      return json(
+        {
+          error: 'Not found'
+        },
+        404
+      );
+    } catch (error) {
+      console.error('[BackgroundBackend] 请求处理失败', error);
+      return json(
+        {
+          error: String(error?.message || error || '后台服务内部错误')
+        },
+        500
+      );
+    }
   }
 
   async alarm() {
@@ -496,6 +506,27 @@ export class BackgroundBackend {
   }
 }
 
+function normalizeAIEndpoint(rawUrl) {
+  const raw = String(rawUrl || '').trim();
+  if (!raw) throw new Error('AI API 地址为空');
+
+  const base = raw.replace(/\/+$/, '');
+
+  // 兼容三种常见填写方式：
+  // 1. https://example.com
+  // 2. https://example.com/v1
+  // 3. https://example.com/v1/chat/completions
+  if (/\/chat\/completions$/i.test(base)) {
+    return base;
+  }
+
+  if (/\/v1$/i.test(base)) {
+    return `${base}/chat/completions`;
+  }
+
+  return `${base}/v1/chat/completions`;
+}
+
 async function callAI(
   aiConfig,
   requestBody
@@ -510,37 +541,46 @@ async function callAI(
     );
   }
 
-  const base = String(
-    aiConfig.url
-  ).replace(/\/$/, '');
+  const endpoint = normalizeAIEndpoint(aiConfig.url);
+  const payload = {
+    ...(requestBody || {}),
+    model:
+      requestBody?.model ||
+      aiConfig.model,
+    stream: false
+  };
 
-  const response = await fetch(
-    `${base}/v1/chat/completions`,
-    {
+  let response;
+  try {
+    response = await fetch(endpoint, {
       method: 'POST',
       headers: {
-        'Content-Type':
-          'application/json',
-        Authorization:
-          `Bearer ${aiConfig.key}`
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${aiConfig.key}`
       },
-      body: JSON.stringify({
-        ...requestBody,
-        model:
-          requestBody.model ||
-          aiConfig.model,
-        stream: false
-      })
-    }
-  );
-
-  if (!response.ok) {
+      body: JSON.stringify(payload)
+    });
+  } catch (error) {
     throw new Error(
-      `AI ${response.status}: ${await response.text()}`
+      `无法连接 AI API：${error?.message || error}`
     );
   }
 
-  return response.json();
+  const responseText = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `AI ${response.status}: ${responseText || response.statusText}`
+    );
+  }
+
+  try {
+    return JSON.parse(responseText);
+  } catch (error) {
+    throw new Error(
+      `AI 返回的不是有效 JSON：${responseText.slice(0, 300)}`
+    );
+  }
 }
 
 function stripForNotification(text) {
@@ -683,8 +723,7 @@ textarea {
   <h2>生成 Web Push 密钥</h2>
 
   <p>
-    第一步：点击下面的按钮，在当前浏览器本地生成一组 VAPID 密钥。
-    <strong>此步骤不需要填写邮箱。</strong>
+    点击下面的按钮，在当前浏览器本地生成一组 VAPID 密钥。
   </p>
 
   <p class="warning">
@@ -704,21 +743,21 @@ textarea {
   <label>VAPID_PRIVATE_KEY</label>
   <textarea id="privateKey" readonly></textarea>
 
+  <label>VAPID_SUBJECT</label>
+  <input
+    id="subject"
+    value="mailto:your-email@example.com"
+  >
+
   <p class="note">
-    <strong>注意：</strong>生成 VAPID 密钥不需要填写邮箱。
-    点击上面的按钮生成密钥后，再到 Cloudflare Worker 的
-    Settings → Variables and Secrets 中单独填写 VAPID_SUBJECT。
+    将这三个值分别添加到 Cloudflare Worker 的
+    Settings → Variables and Secrets。
   </p>
 
   <p class="note">
     VAPID_PUBLIC_KEY 使用普通 Variable；
     VAPID_PRIVATE_KEY 使用 Secret；
     VAPID_SUBJECT 使用普通 Variable。
-  </p>
-
-  <p class="note">
-    VAPID_SUBJECT 示例：
-    <code>mailto:your-email@example.com</code>
   </p>
 </div>
 
