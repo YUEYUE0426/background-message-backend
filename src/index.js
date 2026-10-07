@@ -47,10 +47,9 @@ export class BackgroundBackend {
   }
 
   async fetch(request) {
-    try {
-      const url = new URL(request.url);
+    const url = new URL(request.url);
 
-      if (
+    if (
       url.pathname === '/v1/push/register' &&
       request.method === 'POST'
     ) {
@@ -294,31 +293,29 @@ export class BackgroundBackend {
         );
       }
 
-      const response = await callAI(
-        data.aiConfig,
-        body.requestBody || {}
-      );
+      try {
+        const response = await callAI(
+          data.aiConfig,
+          body.requestBody || {}
+        );
 
-      return json({
-        response
-      });
+        return json({
+          response
+        });
+      } catch (error) {
+        console.error('[BackgroundBackend] AI 请求失败', error);
+        return json({
+          error: error?.message || String(error) || 'AI 请求失败'
+        }, 502);
+      }
     }
 
-      return json(
-        {
-          error: 'Not found'
-        },
-        404
-      );
-    } catch (error) {
-      console.error('[BackgroundBackend] 请求处理失败', error);
-      return json(
-        {
-          error: String(error?.message || error || '后台服务内部错误')
-        },
-        500
-      );
-    }
+    return json(
+      {
+        error: 'Not found'
+      },
+      404
+    );
   }
 
   async alarm() {
@@ -506,27 +503,6 @@ export class BackgroundBackend {
   }
 }
 
-function normalizeAIEndpoint(rawUrl) {
-  const raw = String(rawUrl || '').trim();
-  if (!raw) throw new Error('AI API 地址为空');
-
-  const base = raw.replace(/\/+$/, '');
-
-  // 兼容三种常见填写方式：
-  // 1. https://example.com
-  // 2. https://example.com/v1
-  // 3. https://example.com/v1/chat/completions
-  if (/\/chat\/completions$/i.test(base)) {
-    return base;
-  }
-
-  if (/\/v1$/i.test(base)) {
-    return `${base}/chat/completions`;
-  }
-
-  return `${base}/v1/chat/completions`;
-}
-
 async function callAI(
   aiConfig,
   requestBody
@@ -541,44 +517,54 @@ async function callAI(
     );
   }
 
-  const endpoint = normalizeAIEndpoint(aiConfig.url);
-  const payload = {
-    ...(requestBody || {}),
-    model:
-      requestBody?.model ||
-      aiConfig.model,
-    stream: false
-  };
+  const rawUrl = String(aiConfig.url).trim();
+  let endpoint = rawUrl.replace(/\/+$/, '');
+
+  // 兼容三种常见填写方式：
+  // https://example.com
+  // https://example.com/v1
+  // https://example.com/v1/chat/completions
+  if (!/\/v1\/chat\/completions$/i.test(endpoint)) {
+    if (/\/v1$/i.test(endpoint)) {
+      endpoint += '/chat/completions';
+    } else {
+      endpoint += '/v1/chat/completions';
+    }
+  }
 
   let response;
   try {
-    response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${aiConfig.key}`
-      },
-      body: JSON.stringify(payload)
-    });
+    response = await fetch(
+      endpoint,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${aiConfig.key}`
+        },
+        body: JSON.stringify({
+          ...requestBody,
+          model: requestBody.model || aiConfig.model,
+          stream: false
+        })
+      }
+    );
   } catch (error) {
     throw new Error(
-      `无法连接 AI API：${error?.message || error}`
+      `无法连接 AI API：${error?.message || String(error)}`
     );
   }
 
-  const responseText = await response.text();
-
   if (!response.ok) {
-    throw new Error(
-      `AI ${response.status}: ${responseText || response.statusText}`
-    );
+    const text = await response.text();
+    throw new Error(`AI ${response.status}: ${text.slice(0, 1000)}`);
   }
 
   try {
-    return JSON.parse(responseText);
+    return await response.json();
   } catch (error) {
     throw new Error(
-      `AI 返回的不是有效 JSON：${responseText.slice(0, 300)}`
+      `AI 返回的数据不是有效 JSON：${error?.message || String(error)}`
     );
   }
 }
