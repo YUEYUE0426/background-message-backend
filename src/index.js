@@ -17,11 +17,12 @@ function json(data, status = 200) {
 }
 
 function checkAuth(request, env) {
-  if (!env.BACKEND_TOKEN) return true;
+  // The API must fail closed: an unset token must never make the Worker public.
+  if (typeof env.BACKEND_TOKEN !== 'string' || !env.BACKEND_TOKEN.trim()) return false;
 
   const auth = request.headers.get('Authorization') || '';
 
-  return auth === `Bearer ${env.BACKEND_TOKEN}`;
+  return auth === `Bearer ${env.BACKEND_TOKEN.trim()}`;
 }
 
 export class BackgroundBackend {
