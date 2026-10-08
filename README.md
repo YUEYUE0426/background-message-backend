@@ -21,6 +21,21 @@
 - `VAPID_PRIVATE_KEY`
 - `VAPID_SUBJECT`
 
+### 普通 AI 回覆的背景处理（新增）
+
+普通回覆现由 Cloudflare Queue 在服务器端生成；不要只部署 `src/index.js`，必须同时配置 Queue：
+
+```sh
+npx wrangler queues create uwu-ai-jobs
+npx wrangler deploy
+```
+
+`wrangler.toml` 已配置生产者与消费者绑定。若 Queue 已存在，跳过创建命令即可。部署后，UwU 前端也必须更新为配套版本，因为它会调用 `/v1/ai/submit` 和 `/v1/ai/jobs/{id}`。旧版前端仍可使用同步 `/v1/ai` 路由。
+
+首次测试请在 UwU 中保持 Cloudflare 后台模式，注册 Web Push 通知，然后发送一条普通消息。Worker 应很快返回任务已接收；之后可切换应用到后台。AI 完成时 Worker 会保存回复并发送 Push，回到 UwU 时会同步未读消息。
+
+如果切到后台的动作发生在 Worker 确认任务已接收之前，iOS 仍可能中断最初的提交请求；请先等到 UwU 出现「后台已接收回复任务」提示再切换。服务器收到任务后，后续生成不依赖网页保持运行。
+
 如果需要额外保护后台 API，也可以设置：
 
 - `BACKEND_TOKEN`
