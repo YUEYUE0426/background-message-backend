@@ -21,7 +21,7 @@
 - `VAPID_PRIVATE_KEY`
 - `VAPID_SUBJECT`
 
-### 普通 AI 回覆的背景处理（新增）
+### 普通 AI 回覆的背景处理
 
 普通回覆现由 Cloudflare Queue 在服务器端生成；不要只部署 `src/index.js`，必须同时配置 Queue：
 
