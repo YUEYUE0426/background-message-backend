@@ -162,14 +162,21 @@ export class BackgroundBackend {
       const data = await this.load();
       const messages = data.pendingMessages || [];
 
-      data.pendingMessages = [];
-
-      await this.save(data);
-
       return json({
         ok: true,
         messages
       });
+    }
+
+    if (url.pathname === '/v1/messages/ack' && request.method === 'POST') {
+      const body = await request.json();
+      const ids = new Set(Array.isArray(body.ids) ? body.ids.map(String) : []);
+      if (ids.size) {
+        const data = await this.load();
+        data.pendingMessages = (data.pendingMessages || []).filter(item => !ids.has(String(item.id)));
+        await this.save(data);
+      }
+      return json({ ok: true });
     }
 
     if (
@@ -178,18 +185,24 @@ export class BackgroundBackend {
     ) {
       const body = await request.json();
       const data = await this.load();
-
-      await sendToAll(
+      if (!(data.subscriptions || []).length) return json({ error: '这台设备还没有注册后台通知' }, 400);
+      const pushStats = { sent: 0, failed: 0 };
+      data.subscriptions = await sendToAll(
         this.env,
         data.subscriptions || [],
         {
           title: body.title || '后台通知',
           body: body.body || '后台通知测试成功',
           url: body.url || './'
-        }
+        },
+        pushStats
       );
 
-      return json({ ok: true });
+      await this.save(data);
+
+      if (!pushStats.sent) return json({ error: `推送发送失败（失败数：${pushStats.failed}），请查看 Worker Logs` }, 502);
+
+      return json({ ok: true, sent: pushStats.sent, subscriptions: data.subscriptions.length });
     }
 
     // 保存当前应用中的 AI API 设置。
@@ -680,7 +693,8 @@ function stripForNotification(text) {
 async function sendToAll(
   env,
   subscriptions,
-  payload
+  payload,
+  stats = null
 ) {
   const valid = [];
 
@@ -702,8 +716,10 @@ async function sendToAll(
         }
       );
 
+      if (stats) stats.sent++;
       valid.push(item);
     } catch (error) {
+      if (stats) stats.failed++;
       console.warn(
         '[BackgroundBackend] 推送失败',
         error
