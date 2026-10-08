@@ -293,21 +293,14 @@ export class BackgroundBackend {
         );
       }
 
-      try {
-        const response = await callAI(
-          data.aiConfig,
-          body.requestBody || {}
-        );
+      const response = await callAI(
+        data.aiConfig,
+        body.requestBody || {}
+      );
 
-        return json({
-          response
-        });
-      } catch (error) {
-        console.error('[BackgroundBackend] AI 请求失败', error);
-        return json({
-          error: error?.message || String(error) || 'AI 请求失败'
-        }, 502);
-      }
+      return json({
+        response
+      });
     }
 
     return json(
@@ -517,19 +510,14 @@ async function callAI(
     );
   }
 
-  const rawUrl = String(aiConfig.url).trim();
-  let endpoint = rawUrl.replace(/\/+$/, '');
+  const rawBase = String(aiConfig.url).trim().replace(/\/$/, '');
+  let endpoint = rawBase;
 
-  // 兼容三种常见填写方式：
-  // https://example.com
-  // https://example.com/v1
-  // https://example.com/v1/chat/completions
+  // 支持用户填写：域名、/v1、/v1/chat/completions 三种常见格式。
   if (!/\/v1\/chat\/completions$/i.test(endpoint)) {
-    if (/\/v1$/i.test(endpoint)) {
-      endpoint += '/chat/completions';
-    } else {
-      endpoint += '/v1/chat/completions';
-    }
+    endpoint = /\/v1$/i.test(endpoint)
+      ? `${endpoint}/chat/completions`
+      : `${endpoint}/v1/chat/completions`;
   }
 
   let response;
@@ -539,32 +527,54 @@ async function callAI(
       {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${aiConfig.key}`
+          'Content-Type':
+            'application/json',
+          Authorization:
+            `Bearer ${aiConfig.key}`
         },
         body: JSON.stringify({
           ...requestBody,
-          model: requestBody.model || aiConfig.model,
+          model:
+            requestBody.model ||
+            aiConfig.model,
           stream: false
         })
       }
     );
   } catch (error) {
+    const name = error?.name || 'Error';
+    const message = error?.message || String(error);
     throw new Error(
-      `无法连接 AI API：${error?.message || String(error)}`
+      `AI 网络请求失败 [${name}] ${message}；请求地址：${endpoint}`
     );
   }
 
+  const responseText = await response.text();
+
   if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`AI ${response.status}: ${text.slice(0, 1000)}`);
+    let detail = responseText;
+    try {
+      const parsed = JSON.parse(responseText);
+      detail =
+        parsed?.error?.message ||
+        parsed?.error ||
+        parsed?.message ||
+        parsed?.detail ||
+        responseText;
+    } catch (_) {
+      // 保留原始文本。
+    }
+
+    throw new Error(
+      `AI ${response.status}: ${String(detail || '无响应内容').slice(0, 1500)}；请求地址：${endpoint}`
+    );
   }
 
   try {
-    return await response.json();
-  } catch (error) {
+    return JSON.parse(responseText);
+  } catch (_) {
     throw new Error(
-      `AI 返回的数据不是有效 JSON：${error?.message || String(error)}`
+      `AI 返回的数据不是有效 JSON：${responseText.slice(0, 1000)}`
     );
   }
 }
@@ -916,16 +926,34 @@ export default {
         id
       );
 
-    return stub.fetch(
-      new Request(request, {
-        body:
-          request.method === 'POST'
-            ? JSON.stringify(
-                incoming
-              )
-            : undefined
-      })
-    );
+    try {
+      return await stub.fetch(
+        new Request(request, {
+          body:
+            request.method === 'POST'
+              ? JSON.stringify(
+                  incoming
+                )
+              : undefined
+        })
+      );
+    } catch (error) {
+      // 关键：避免 iOS Safari 只收到 TypeError: Load failed。
+      // Durable Object / Worker 的任何未捕获错误都统一转成带 CORS 的 JSON。
+      const name = error?.name || 'Error';
+      const message = error?.message || String(error);
+      console.error(
+        '[BackgroundBackend] 未捕获请求错误',
+        error
+      );
+      return json(
+        {
+          error: `后台服务内部错误 [${name}] ${message}`,
+          path: url.pathname
+        },
+        500
+      );
+    }
   },
 
   BackgroundBackend
