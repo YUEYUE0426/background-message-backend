@@ -46,6 +46,17 @@ export class BackgroundBackend {
     await this.state.storage.put('data', data);
   }
 
+  async setAlarmIfChanged(timestamp) {
+    const currentAlarm = await this.state.storage.getAlarm();
+    if (timestamp == null) {
+      if (currentAlarm !== null) await this.state.storage.deleteAlarm();
+      return;
+    }
+    if (currentAlarm !== timestamp) {
+      await this.state.storage.setAlarm(timestamp);
+    }
+  }
+
   async fetch(request) {
     const url = new URL(request.url);
 
@@ -98,6 +109,7 @@ export class BackgroundBackend {
       data.aiJobs = data.aiJobs || {};
       const job = data.aiJobs[body.jobId];
       if (!job) return json({ error: 'Job not found' }, 404);
+      let savedBeforePush = false;
       job.status = body.error ? 'failed' : 'completed';
       job.updatedAt = Date.now();
       if (body.error) job.error = String(body.error).slice(0, 1500);
@@ -112,8 +124,10 @@ export class BackgroundBackend {
           // Persist the reply before sending Push so opening the app from the
           // notification can immediately pull the completed message.
           await this.save(data);
+          savedBeforePush = true;
           const notificationMessages = splitNotificationMessages(content, job.chatStatusRegex || data.chats?.[job.chatId]?.statusRegex || '');
           const title = job.chatName || data.chats?.[job.chatId]?.remarkName || data.chats?.[job.chatId]?.realName || '新消息';
+          const subscriptionEndpointsBefore = JSON.stringify((data.subscriptions || []).map(item => item.subscription?.endpoint || item.endpoint || ''));
           for (let index = 0; index < notificationMessages.length; index++) {
             if (index > 0) await new Promise(resolve => setTimeout(resolve, 350));
             data.subscriptions = await sendToAll(this.env, data.subscriptions || [], {
@@ -124,21 +138,25 @@ export class BackgroundBackend {
               chatId: job.chatId, chatType: job.chatType
             });
           }
+          const subscriptionEndpointsAfter = JSON.stringify((data.subscriptions || []).map(item => item.subscription?.endpoint || item.endpoint || ''));
+          // The reply was already persisted. Write again only when expired push
+          // subscriptions were removed while delivering the notification.
+          if (subscriptionEndpointsBefore !== subscriptionEndpointsAfter) await this.save(data);
         }
       }
-      await this.save(data);
+      if (!savedBeforePush) await this.save(data);
       return json({ ok: true });
     }
 
     if (url.pathname === '/__internal/jobs/ack' && request.method === 'POST') {
       const body = await request.json();
       const data = await this.load();
-      data.pendingMessages = (data.pendingMessages || []).filter(item => item.id !== body.jobId);
-      // The client only acknowledges after the reply has been saved locally.
-      // Drop the completed job (which contains the prompt, API config, and result)
-      // at the same time so it does not remain in Durable Object storage.
-      if (body.jobId && data.aiJobs) delete data.aiJobs[body.jobId];
-      await this.save(data);
+      const pendingMessages = data.pendingMessages || [];
+      const remainingMessages = pendingMessages.filter(item => item.id !== body.jobId);
+      if (remainingMessages.length !== pendingMessages.length) {
+        data.pendingMessages = remainingMessages;
+        await this.save(data);
+      }
       return json({ ok: true });
     }
 
@@ -187,8 +205,12 @@ export class BackgroundBackend {
       const ids = new Set(Array.isArray(body.ids) ? body.ids.map(String) : []);
       if (ids.size) {
         const data = await this.load();
-        data.pendingMessages = (data.pendingMessages || []).filter(item => !ids.has(String(item.id)));
-        await this.save(data);
+        const pendingMessages = data.pendingMessages || [];
+        const remainingMessages = pendingMessages.filter(item => !ids.has(String(item.id)));
+        if (remainingMessages.length !== pendingMessages.length) {
+          data.pendingMessages = remainingMessages;
+          await this.save(data);
+        }
       }
       return json({ ok: true });
     }
@@ -200,6 +222,7 @@ export class BackgroundBackend {
       const body = await request.json();
       const data = await this.load();
       if (!(data.subscriptions || []).length) return json({ error: '这台设备还没有注册后台通知' }, 400);
+      const subscriptionEndpointsBefore = JSON.stringify((data.subscriptions || []).map(item => item.subscription?.endpoint || item.endpoint || ''));
       const pushStats = { sent: 0, failed: 0, errors: [] };
       data.subscriptions = await sendToAll(
         this.env,
@@ -212,7 +235,8 @@ export class BackgroundBackend {
         pushStats
       );
 
-      await this.save(data);
+      const subscriptionEndpointsAfter = JSON.stringify((data.subscriptions || []).map(item => item.subscription?.endpoint || item.endpoint || ''));
+      if (subscriptionEndpointsBefore !== subscriptionEndpointsAfter) await this.save(data);
 
       if (!pushStats.sent) return json({
         error: `推送发送失败（失败数：${pushStats.failed}）`,
@@ -245,7 +269,7 @@ export class BackgroundBackend {
         );
       }
 
-      data.aiConfig = {
+      const nextAiConfig = {
         provider: String(
           ai.provider || 'newapi'
         ),
@@ -254,7 +278,10 @@ export class BackgroundBackend {
         model: String(ai.model).trim()
       };
 
-      await this.save(data);
+      if (JSON.stringify(data.aiConfig) !== JSON.stringify(nextAiConfig)) {
+        data.aiConfig = nextAiConfig;
+        await this.save(data);
+      }
 
       return json({
         ok: true,
@@ -315,7 +342,7 @@ export class BackgroundBackend {
       )
         .filter(
           chat =>
-            chat.autoReply?.enabled
+            chat.autoReply?.enabled && chat.requestBody
         )
         .map(chat => {
           return (
@@ -336,11 +363,7 @@ export class BackgroundBackend {
           );
         });
 
-      if (times.length) {
-        await this.state.storage.setAlarm(
-          Math.min(...times)
-        );
-      }
+      await this.setAlarmIfChanged(times.length ? Math.min(...times) : null);
 
       return json({ ok: true });
     }
@@ -352,10 +375,11 @@ export class BackgroundBackend {
       const body = await request.json();
       const data = await this.load();
 
-      data.proactive =
-        body.chats || {};
-
-      await this.save(data);
+      const proactiveSettings = body.chats || {};
+      if (JSON.stringify(data.proactive || {}) !== JSON.stringify(proactiveSettings)) {
+        data.proactive = proactiveSettings;
+        await this.save(data);
+      }
 
       return json({ ok: true });
     }
@@ -428,6 +452,7 @@ export class BackgroundBackend {
     const data = await this.load();
     const now = Date.now();
     let nextAlarm = 0;
+    let stateChanged = false;
 
     for (
       const [chatId, chat] of Object.entries(
@@ -573,6 +598,7 @@ export class BackgroundBackend {
         }
 
         ar.lastTriggerTime = now;
+        stateChanged = true;
       }
 
       const next =
@@ -590,13 +616,8 @@ export class BackgroundBackend {
       }
     }
 
-    await this.save(data);
-
-    if (nextAlarm) {
-      await this.state.storage.setAlarm(
-        nextAlarm
-      );
-    }
+    if (stateChanged) await this.save(data);
+    await this.setAlarmIfChanged(nextAlarm || null);
   }
 }
 
@@ -705,9 +726,8 @@ function splitNotificationMessages(text, statusRegex = '') {
 
   const segments = [...visible.matchAll(/\[([^\]\r\n]+)\]/g)].map(match => match[1].trim());
   const messages = [];
-  const isInternalUpdate = value => /更新状态(?:为)?|状态更新|状态栏|状态面板|思维链|<\/?thinking>|system(?:-display)?\s*:/i.test(String(value || ''));
   for (const segment of segments) {
-    if (isInternalUpdate(segment)) continue;
+    if (/更新状态为|system(?:-display)?\s*:/i.test(segment)) continue;
     if (/已接收礼物|(?:接收|退回).*转账|(?:同意|拒绝).*代付/.test(segment)) continue;
 
     const payloadMatch = segment.match(/[：:]([\s\S]*)$/);
@@ -718,7 +738,7 @@ function splitNotificationMessages(text, statusRegex = '') {
       messages.push(payload);
     } else if (/撤回了一条消息[：:]/.test(segment) && payload) {
       messages.push(`撤回消息：${payload}`);
-    } else if (segment) {
+    } else if (segment && !/更新状态为/.test(segment)) {
       // Preserve other user-facing bracket messages, including future UwU formats.
       messages.push(segment.slice(0, 360));
     }
@@ -726,7 +746,7 @@ function splitNotificationMessages(text, statusRegex = '') {
 
   if (!messages.length && !segments.length) {
     const lines = visible.replace(/<[^>]*>/g, '').trim().split(/\s*\r?\n+\s*/).map(line => line.trim()).filter(Boolean);
-    messages.push(...lines.filter(line => !isInternalUpdate(line)));
+    messages.push(...lines);
   }
 
   return messages
