@@ -61,7 +61,7 @@ export class BackgroundBackend {
       for (const [id] of retained.slice(100)) delete data.aiJobs[id];
       data.aiJobs[body.jobId] = { status: 'queued', createdAt: Date.now(), aiConfig: body.aiConfig,
         requestBody: body.requestBody, chatId: body.chatId || '', chatType: body.chatType || 'private',
-        chatName: String(body.chatName || data.chats?.[body.chatId]?.realName || '').slice(0, 120), appUrl: body.appUrl || './' };
+        chatName: String(body.chatName || data.chats?.[body.chatId]?.remarkName || data.chats?.[body.chatId]?.realName || '').slice(0, 120), appUrl: body.appUrl || './' };
       await this.save(data);
       return json({ ok: true });
     }
@@ -111,11 +111,18 @@ export class BackgroundBackend {
           // Persist the reply before sending Push so opening the app from the
           // notification can immediately pull the completed message.
           await this.save(data);
-          data.subscriptions = await sendToAll(this.env, data.subscriptions || [], {
-            title: job.chatName || data.chats?.[job.chatId]?.realName || '新消息',
-            body: stripForNotification(content), url: job.appUrl,
-            chatId: job.chatId, chatType: job.chatType
-          });
+          const notificationMessages = splitNotificationMessages(content);
+          const title = job.chatName || data.chats?.[job.chatId]?.remarkName || data.chats?.[job.chatId]?.realName || '新消息';
+          for (let index = 0; index < notificationMessages.length; index++) {
+            if (index > 0) await new Promise(resolve => setTimeout(resolve, 350));
+            data.subscriptions = await sendToAll(this.env, data.subscriptions || [], {
+              title,
+              body: notificationMessages[index],
+              tag: `uwu-${job.jobId || body.jobId}-${index}`,
+              url: job.appUrl,
+              chatId: job.chatId, chatType: job.chatType
+            });
+          }
         }
       }
       await this.save(data);
@@ -279,6 +286,8 @@ export class BackgroundBackend {
           body.chatType || 'private',
         realName:
           body.realName || '',
+        remarkName:
+          body.remarkName || body.realName || '',
         myName:
           body.myName || '用户',
         requestBody:
@@ -540,7 +549,7 @@ export class BackgroundBackend {
                   [],
                 {
                   title:
-                    chat.realName ||
+                    chat.remarkName || chat.realName ||
                     '新消息',
                   body:
                     stripForNotification(
@@ -687,9 +696,37 @@ function stripForNotification(text) {
   // Keep ordinary replies wrapped in UwU's [Name的消息：…] syntax.
   const wrappedReplies = [...visible.matchAll(/\[[^\]\r\n]*(?:消息|回复)[：:]([\s\S]*?)\]/g)]
     .map(match => match[1].trim()).filter(Boolean);
-  if (wrappedReplies.length) visible = wrappedReplies.join(' / ');
-  visible = visible.replace(/<[^>]*>/g, '').replace(/\[[^\]]*\]/g, '').replace(/\s+/g, ' ').trim();
+  if (wrappedReplies.length) {
+    visible = wrappedReplies.join(' / ');
+  } else {
+    visible = visible.replace(/<[^>]*>/g, '').replace(/\[[^\]]*\]/g, '').trim();
+    const lines = visible.split(/\s*\r?\n+\s*/).map(line => line.trim()).filter(Boolean);
+    if (lines.length > 1) visible = lines.join(' / ');
+  }
+  visible = visible.replace(/\s+/g, ' ').trim();
   return visible.slice(0, 360) || '收到一条新消息';
+}
+
+function splitNotificationMessages(text) {
+  let visible = String(text || '').trim();
+  if (/<\/thinking>/i.test(visible) && !/^\s*<thinking>/i.test(visible)) visible = `<thinking>${visible}`;
+  const lastThinkingEnd = visible.toLowerCase().lastIndexOf('</thinking>');
+  if (lastThinkingEnd >= 0) visible = visible.slice(lastThinkingEnd + '</thinking>'.length);
+  visible = visible.replace(/<thinking>[\s\S]*?(?:<\/thinking>|$)/gi, '');
+
+  // UwU's ordinary replies are emitted as one bracketed message per bubble.
+  // Send each bubble as its own push notification rather than joining them.
+  const wrappedReplies = [...visible.matchAll(/\[[^\]\r\n]*(?:消息|回复)[：:]([\s\S]*?)\]/g)]
+    .map(match => match[1].trim()).filter(Boolean);
+  let messages = wrappedReplies;
+  if (!messages.length) {
+    visible = visible.replace(/<[^>]*>/g, '').replace(/\[[^\]]*\]/g, '').trim();
+    messages = visible.split(/\s*\r?\n+\s*/).map(line => line.trim()).filter(Boolean);
+  }
+  return (messages.length ? messages : ['收到一条新消息'])
+    .map(message => message.replace(/\s+/g, ' ').trim().slice(0, 360))
+    .filter(Boolean)
+    .slice(0, 8);
 }
 
 async function sendToAll(
