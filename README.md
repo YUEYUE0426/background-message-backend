@@ -20,6 +20,9 @@
 - `VAPID_PUBLIC_KEY`
 - `VAPID_PRIVATE_KEY`
 - `VAPID_SUBJECT`
+- `BACKEND_TOKEN`（Secret，必填）
+
+`BACKEND_TOKEN` 是访问 Worker API 的必填认证密钥。没有配置时，Worker 会拒绝所有受保护的 API 请求；不要将它提交到 GitHub。建议使用至少 32 字符的随机值，并只保存在 Cloudflare Secret 与自己的「后台访问 Token」栏位。
 
 ### 普通 AI 回覆的背景处理
 
@@ -30,17 +33,13 @@ npx wrangler queues create uwu-ai-jobs
 npx wrangler deploy
 ```
 
-`wrangler.toml` 已配置生产者与消费者绑定。若 Queue 已存在，跳过创建命令即可。部署后，UwU 前端也必须更新为配套版本，因为它会调用 `/v1/ai/submit` 和 `/v1/ai/jobs/{id}`。旧版前端仍可使用同步 `/v1/ai` 路由。
+`wrangler.toml` 已配置生产者与消费者绑定。若 Queue 已存在，跳过创建命令即可。部署后，前端也必须更新为配套版本，因为它会调用 `/v1/ai/submit` 和 `/v1/ai/jobs/{id}`。旧版前端仍可使用同步 `/v1/ai` 路由。
 
-首次测试请在 UwU 中保持 Cloudflare 后台模式，注册 Web Push 通知，然后发送一条普通消息。Worker 应很快返回任务已接收；之后可切换应用到后台。AI 完成时 Worker 会保存回复并发送 Push，回到 UwU 时会同步未读消息。
+首次测试请保持 Cloudflare 后台模式，注册 Web Push 通知，然后发送一条普通消息。Worker 应很快返回任务已接收；之后可切换应用到后台。AI 完成时 Worker 会保存回复并发送 Push，回去时会同步未读消息。
 
-如果切到后台的动作发生在 Worker 确认任务已接收之前，iOS 仍可能中断最初的提交请求；请先等到 UwU 出现「后台已接收回复任务」提示再切换。服务器收到任务后，后续生成不依赖网页保持运行。
+如果切到后台的动作发生在 Worker 确认任务已接收之前，iOS 仍可能中断最初的提交请求；请先等到出现「后台已接收回复任务」提示再切换。服务器收到任务后，后续生成不依赖网页保持运行。
 
-如果需要额外保护后台 API，也可以设置：
-
-- `BACKEND_TOKEN`
-
-请不要把这些敏感信息提交到公开 GitHub 仓库。
+请不要把任何 Secret 或敏感信息提交到公开 GitHub 仓库。
 
 ## AI API
 
