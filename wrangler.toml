@@ -10,3 +10,13 @@ bindings = [
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["BackgroundBackend"]
+
+[[queues.producers]]
+binding = "AI_QUEUE"
+queue = "uwu-ai-jobs"
+
+[[queues.consumers]]
+queue = "uwu-ai-jobs"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 3
