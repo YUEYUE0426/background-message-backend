@@ -61,7 +61,8 @@ export class BackgroundBackend {
       for (const [id] of retained.slice(100)) delete data.aiJobs[id];
       data.aiJobs[body.jobId] = { status: 'queued', createdAt: Date.now(), aiConfig: body.aiConfig,
         requestBody: body.requestBody, chatId: body.chatId || '', chatType: body.chatType || 'private',
-        chatName: String(body.chatName || data.chats?.[body.chatId]?.remarkName || data.chats?.[body.chatId]?.realName || '').slice(0, 120), appUrl: body.appUrl || './' };
+        chatName: String(body.chatName || data.chats?.[body.chatId]?.remarkName || data.chats?.[body.chatId]?.realName || '').slice(0, 120),
+        chatStatusRegex: String(body.chatStatusRegex || data.chats?.[body.chatId]?.statusRegex || '').slice(0, 500), appUrl: body.appUrl || './' };
       await this.save(data);
       return json({ ok: true });
     }
@@ -111,7 +112,7 @@ export class BackgroundBackend {
           // Persist the reply before sending Push so opening the app from the
           // notification can immediately pull the completed message.
           await this.save(data);
-          const notificationMessages = splitNotificationMessages(content);
+          const notificationMessages = splitNotificationMessages(content, job.chatStatusRegex || data.chats?.[job.chatId]?.statusRegex || '');
           const title = job.chatName || data.chats?.[job.chatId]?.remarkName || data.chats?.[job.chatId]?.realName || '新消息';
           for (let index = 0; index < notificationMessages.length; index++) {
             if (index > 0) await new Promise(resolve => setTimeout(resolve, 350));
@@ -288,6 +289,8 @@ export class BackgroundBackend {
           body.realName || '',
         remarkName:
           body.remarkName || body.realName || '',
+        statusRegex:
+          String(body.chatStatusRegex || '').slice(0, 500),
         myName:
           body.myName || '用户',
         requestBody:
@@ -543,27 +546,18 @@ export class BackgroundBackend {
                   );
               }
 
-              await sendToAll(
-                this.env,
-                data.subscriptions ||
-                  [],
-                {
-                  title:
-                    chat.remarkName || chat.realName ||
-                    '新消息',
-                  body:
-                    stripForNotification(
-                      text
-                    ),
+              const notificationMessages = splitNotificationMessages(text, chat.statusRegex || '');
+              for (let index = 0; index < notificationMessages.length; index++) {
+                if (index > 0) await new Promise(resolve => setTimeout(resolve, 350));
+                data.subscriptions = await sendToAll(this.env, data.subscriptions || [], {
+                  title: chat.remarkName || chat.realName || '新消息',
+                  body: notificationMessages[index],
+                  tag: `uwu-${chatId}-${now}-${index}`,
                   chatId,
-                  chatType:
-                    chat.chatType ||
-                    'private',
-                  url:
-                    chat.appUrl ||
-                    './'
-                }
-              );
+                  chatType: chat.chatType || 'private',
+                  url: chat.appUrl || './'
+                });
+              }
             }
           }
         } catch (error) {
@@ -685,45 +679,52 @@ async function callAI(
   }
 }
 
-function stripForNotification(text) {
-  let visible = String(text || '').trim();
-  // Match UwU's foreground repair when a proxy strips the opening CoT tag.
-  if (/<\/thinking>/i.test(visible) && !/^\s*<thinking>/i.test(visible)) visible = `<thinking>${visible}`;
-  const lastThinkingEnd = visible.toLowerCase().lastIndexOf('</thinking>');
-  if (lastThinkingEnd >= 0) visible = visible.slice(lastThinkingEnd + '</thinking>'.length);
-  visible = visible.replace(/<thinking>[\s\S]*?(?:<\/thinking>|$)/gi, '');
-
-  // Keep ordinary replies wrapped in UwU's [Name的消息：…] syntax.
-  const wrappedReplies = [...visible.matchAll(/\[[^\]\r\n]*(?:消息|回复)[：:]([\s\S]*?)\]/g)]
-    .map(match => match[1].trim()).filter(Boolean);
-  if (wrappedReplies.length) {
-    visible = wrappedReplies.join(' / ');
-  } else {
-    visible = visible.replace(/<[^>]*>/g, '').replace(/\[[^\]]*\]/g, '').trim();
-    const lines = visible.split(/\s*\r?\n+\s*/).map(line => line.trim()).filter(Boolean);
-    if (lines.length > 1) visible = lines.join(' / ');
-  }
-  visible = visible.replace(/\s+/g, ' ').trim();
-  return visible.slice(0, 360) || '收到一条新消息';
-}
-
-function splitNotificationMessages(text) {
+function splitNotificationMessages(text, statusRegex = '') {
   let visible = String(text || '').trim();
   if (/<\/thinking>/i.test(visible) && !/^\s*<thinking>/i.test(visible)) visible = `<thinking>${visible}`;
   const lastThinkingEnd = visible.toLowerCase().lastIndexOf('</thinking>');
   if (lastThinkingEnd >= 0) visible = visible.slice(lastThinkingEnd + '</thinking>'.length);
   visible = visible.replace(/<thinking>[\s\S]*?(?:<\/thinking>|$)/gi, '');
 
-  // UwU's ordinary replies are emitted as one bracketed message per bubble.
-  // Send each bubble as its own push notification rather than joining them.
-  const wrappedReplies = [...visible.matchAll(/\[[^\]\r\n]*(?:消息|回复)[：:]([\s\S]*?)\]/g)]
-    .map(match => match[1].trim()).filter(Boolean);
-  let messages = wrappedReplies;
-  if (!messages.length) {
-    visible = visible.replace(/<[^>]*>/g, '').replace(/\[[^\]]*\]/g, '').trim();
-    messages = visible.split(/\s*\r?\n+\s*/).map(line => line.trim()).filter(Boolean);
+  // Remove the chat's configured status-panel block, when UwU supplied its regex.
+  if (statusRegex) {
+    try {
+      let source = String(statusRegex).trim();
+      let flags = 'g';
+      const slashForm = source.match(/^\/(.*)\/([dgimsuvy]*)$/s);
+      if (slashForm) { source = slashForm[1]; flags = slashForm[2].includes('g') ? slashForm[2] : `${slashForm[2]}g`; }
+      visible = visible.replace(new RegExp(source, flags), '');
+    } catch (error) {
+      console.warn('[BackgroundBackend] 状态栏正则无效，改用默认过滤', error);
+    }
   }
-  return (messages.length ? messages : ['收到一条新消息'])
+
+  const segments = [...visible.matchAll(/\[([^\]\r\n]+)\]/g)].map(match => match[1].trim());
+  const messages = [];
+  for (const segment of segments) {
+    if (/更新状态为|system(?:-display)?\s*:/i.test(segment)) continue;
+    if (/已接收礼物|(?:接收|退回).*转账|(?:同意|拒绝).*代付/.test(segment)) continue;
+
+    const payloadMatch = segment.match(/[：:]([\s\S]*)$/);
+    const payload = payloadMatch ? payloadMatch[1].trim() : '';
+    if (/的表情包[：:]/.test(segment) && payload) {
+      messages.push(`发送了表情包：${payload}`);
+    } else if (/的消息[：:]|并回复[：:]|的语音[：:]|发来的照片\/视频[：:]|的转账[：:]|送来的礼物[：:]/.test(segment) && payload) {
+      messages.push(payload);
+    } else if (/撤回了一条消息[：:]/.test(segment) && payload) {
+      messages.push(`撤回消息：${payload}`);
+    } else if (segment && !/更新状态为/.test(segment)) {
+      // Preserve other user-facing bracket messages, including future UwU formats.
+      messages.push(segment.slice(0, 360));
+    }
+  }
+
+  if (!messages.length && !segments.length) {
+    const lines = visible.replace(/<[^>]*>/g, '').trim().split(/\s*\r?\n+\s*/).map(line => line.trim()).filter(Boolean);
+    messages.push(...lines);
+  }
+
+  return messages
     .map(message => message.replace(/\s+/g, ' ').trim().slice(0, 360))
     .filter(Boolean)
     .slice(0, 8);
@@ -1055,7 +1056,8 @@ export default {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ jobId, aiConfig: { provider: String(ai.provider || 'newapi'), url: String(ai.url).trim(),
             key: String(ai.key).trim(), model: String(ai.model).trim() }, requestBody: body.requestBody || {},
-            chatId: body.chatId || '', chatType: body.chatType || 'private', chatName: body.chatName || '', appUrl: body.appUrl || './' })
+            chatId: body.chatId || '', chatType: body.chatType || 'private', chatName: body.chatName || '',
+            chatStatusRegex: body.chatStatusRegex || '', appUrl: body.appUrl || './' })
         });
         if (!saved.ok) throw new Error('无法保存后台任务');
         try {
