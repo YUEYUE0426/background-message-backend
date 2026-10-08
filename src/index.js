@@ -60,7 +60,8 @@ export class BackgroundBackend {
       const retained = Object.entries(data.aiJobs).sort((a, b) => Number(b[1].createdAt || 0) - Number(a[1].createdAt || 0));
       for (const [id] of retained.slice(100)) delete data.aiJobs[id];
       data.aiJobs[body.jobId] = { status: 'queued', createdAt: Date.now(), aiConfig: body.aiConfig,
-        requestBody: body.requestBody, chatId: body.chatId || '', chatType: body.chatType || 'private', appUrl: body.appUrl || './' };
+        requestBody: body.requestBody, chatId: body.chatId || '', chatType: body.chatType || 'private',
+        chatName: String(body.chatName || data.chats?.[body.chatId]?.realName || '').slice(0, 120), appUrl: body.appUrl || './' };
       await this.save(data);
       return json({ ok: true });
     }
@@ -111,7 +112,8 @@ export class BackgroundBackend {
           // notification can immediately pull the completed message.
           await this.save(data);
           data.subscriptions = await sendToAll(this.env, data.subscriptions || [], {
-            title: 'UwU 收到新回覆', body: stripForNotification(content), url: job.appUrl,
+            title: job.chatName || data.chats?.[job.chatId]?.realName || '新消息',
+            body: stripForNotification(content), url: job.appUrl,
             chatId: job.chatId, chatType: job.chatType
           });
         }
@@ -675,22 +677,19 @@ async function callAI(
 }
 
 function stripForNotification(text) {
-  return String(text || '')
-    .replace(
-      /<thinking>[\s\S]*?<\/thinking>/gi,
-      ''
-    )
-    .replace(
-      /\[[^\]]*\]/g,
-      ''
-    )
-    .replace(
-      /\s+/g,
-      ' '
-    )
-    .trim()
-    .slice(0, 180) ||
-    '收到一条新消息';
+  let visible = String(text || '').trim();
+  // Match UwU's foreground repair when a proxy strips the opening CoT tag.
+  if (/<\/thinking>/i.test(visible) && !/^\s*<thinking>/i.test(visible)) visible = `<thinking>${visible}`;
+  const lastThinkingEnd = visible.toLowerCase().lastIndexOf('</thinking>');
+  if (lastThinkingEnd >= 0) visible = visible.slice(lastThinkingEnd + '</thinking>'.length);
+  visible = visible.replace(/<thinking>[\s\S]*?(?:<\/thinking>|$)/gi, '');
+
+  // Keep ordinary replies wrapped in UwU's [Name的消息：…] syntax.
+  const wrappedReplies = [...visible.matchAll(/\[[^\]\r\n]*(?:消息|回复)[：:]([\s\S]*?)\]/g)]
+    .map(match => match[1].trim()).filter(Boolean);
+  if (wrappedReplies.length) visible = wrappedReplies.join(' / ');
+  visible = visible.replace(/<[^>]*>/g, '').replace(/\[[^\]]*\]/g, '').replace(/\s+/g, ' ').trim();
+  return visible.slice(0, 360) || '收到一条新消息';
 }
 
 async function sendToAll(
@@ -1019,7 +1018,7 @@ export default {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ jobId, aiConfig: { provider: String(ai.provider || 'newapi'), url: String(ai.url).trim(),
             key: String(ai.key).trim(), model: String(ai.model).trim() }, requestBody: body.requestBody || {},
-            chatId: body.chatId || '', chatType: body.chatType || 'private', appUrl: body.appUrl || './' })
+            chatId: body.chatId || '', chatType: body.chatType || 'private', chatName: body.chatName || '', appUrl: body.appUrl || './' })
         });
         if (!saved.ok) throw new Error('无法保存后台任务');
         try {
