@@ -138,7 +138,7 @@ export class BackgroundBackend {
       data.subscriptions = (data.subscriptions || [])
         .filter(
           item =>
-            item.endpoint !==
+            (item.subscription?.endpoint || item.endpoint) !==
             body.subscription?.endpoint
         );
 
@@ -186,7 +186,7 @@ export class BackgroundBackend {
       const body = await request.json();
       const data = await this.load();
       if (!(data.subscriptions || []).length) return json({ error: '这台设备还没有注册后台通知' }, 400);
-      const pushStats = { sent: 0, failed: 0 };
+      const pushStats = { sent: 0, failed: 0, errors: [] };
       data.subscriptions = await sendToAll(
         this.env,
         data.subscriptions || [],
@@ -200,7 +200,10 @@ export class BackgroundBackend {
 
       await this.save(data);
 
-      if (!pushStats.sent) return json({ error: `推送发送失败（失败数：${pushStats.failed}），请查看 Worker Logs` }, 502);
+      if (!pushStats.sent) return json({
+        error: `推送发送失败（失败数：${pushStats.failed}）`,
+        failures: pushStats.errors.slice(0, 5)
+      }, 502);
 
       return json({ ok: true, sent: pushStats.sent, subscriptions: data.subscriptions.length });
     }
@@ -720,6 +723,12 @@ async function sendToAll(
       valid.push(item);
     } catch (error) {
       if (stats) stats.failed++;
+      if (stats?.errors && stats.errors.length < 5) {
+        stats.errors.push({
+          statusCode: Number(error?.statusCode || error?.status || 0) || null,
+          message: String(error?.message || error || '未知推送错误').slice(0, 240)
+        });
+      }
       console.warn(
         '[BackgroundBackend] 推送失败',
         error
