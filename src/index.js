@@ -899,6 +899,57 @@ export default {
       });
     }
 
+    // AI 请求不再经过 Durable Object。
+    // UwU 每次请求都会把当前正在使用的 AI API 设置一并传过来，
+    // 因此这里可以直接由 Worker 调用 AI API。
+    // 这样可避免 iOS Safari 在 Durable Object -> Worker 异常链路中
+    // 将真实错误吞掉并只显示 TypeError: Load failed。
+    if (
+      url.pathname === '/v1/ai' &&
+      request.method === 'POST'
+    ) {
+      try {
+        const body = await request.json();
+        const ai = body.aiConfig || {};
+
+        if (!ai.url || !ai.key || !ai.model) {
+          return json(
+            { error: '尚未同步 AI API 设置' },
+            400
+          );
+        }
+
+        const aiConfig = {
+          provider: String(ai.provider || 'newapi').trim(),
+          url: String(ai.url).trim(),
+          key: String(ai.key).trim(),
+          model: String(ai.model).trim()
+        };
+
+        const response = await callAI(
+          aiConfig,
+          body.requestBody || {}
+        );
+
+        return json({ response });
+      } catch (error) {
+        const name = error?.name || 'Error';
+        const message = error?.message || String(error);
+
+        console.error(
+          '[BackgroundBackend] /v1/ai 请求失败',
+          error
+        );
+
+        return json(
+          {
+            error: `后台 AI 请求失败 [${name}] ${message}`
+          },
+          502
+        );
+      }
+    }
+
     const clone =
       request.clone();
 
