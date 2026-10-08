@@ -726,7 +726,8 @@ async function sendToAll(
       if (stats?.errors && stats.errors.length < 5) {
         stats.errors.push({
           statusCode: Number(error?.statusCode || error?.status || 0) || null,
-          message: String(error?.message || error || '未知推送错误').slice(0, 240)
+          message: String(error?.message || error || '未知推送错误').slice(0, 240),
+          reason: String(error?.body || '').slice(0, 240)
         });
       }
       console.warn(
