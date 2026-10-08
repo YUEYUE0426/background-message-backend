@@ -1,6 +1,7 @@
 name = "background-message-backend"
 main = "src/index.js"
 compatibility_date = "2026-10-05"
+keep_vars = true
 
 [durable_objects]
 bindings = [
