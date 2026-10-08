@@ -705,8 +705,9 @@ function splitNotificationMessages(text, statusRegex = '') {
 
   const segments = [...visible.matchAll(/\[([^\]\r\n]+)\]/g)].map(match => match[1].trim());
   const messages = [];
+  const isInternalUpdate = value => /更新状态(?:为)?|状态更新|状态栏|状态面板|思维链|<\/?thinking>|system(?:-display)?\s*:/i.test(String(value || ''));
   for (const segment of segments) {
-    if (/更新状态为|system(?:-display)?\s*:/i.test(segment)) continue;
+    if (isInternalUpdate(segment)) continue;
     if (/已接收礼物|(?:接收|退回).*转账|(?:同意|拒绝).*代付/.test(segment)) continue;
 
     const payloadMatch = segment.match(/[：:]([\s\S]*)$/);
@@ -717,7 +718,7 @@ function splitNotificationMessages(text, statusRegex = '') {
       messages.push(payload);
     } else if (/撤回了一条消息[：:]/.test(segment) && payload) {
       messages.push(`撤回消息：${payload}`);
-    } else if (segment && !/更新状态为/.test(segment)) {
+    } else if (segment) {
       // Preserve other user-facing bracket messages, including future UwU formats.
       messages.push(segment.slice(0, 360));
     }
@@ -725,7 +726,7 @@ function splitNotificationMessages(text, statusRegex = '') {
 
   if (!messages.length && !segments.length) {
     const lines = visible.replace(/<[^>]*>/g, '').trim().split(/\s*\r?\n+\s*/).map(line => line.trim()).filter(Boolean);
-    messages.push(...lines);
+    messages.push(...lines.filter(line => !isInternalUpdate(line)));
   }
 
   return messages
