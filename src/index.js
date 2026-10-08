@@ -16,6 +16,18 @@ function json(data, status = 200) {
   });
 }
 
+function latestTimestamp(...values) {
+  return values.reduce((latest, value) => {
+    const timestamp = Number(value);
+    return Number.isFinite(timestamp) ? Math.max(latest, timestamp) : latest;
+  }, 0);
+}
+
+function autoReplyIntervalMs(value) {
+  const minutes = Number(value || 60);
+  return Math.max(5, Number.isFinite(minutes) ? minutes : 60) * 60 * 1000;
+}
+
 function checkAuth(request, env) {
   // The API must fail closed: an unset token must never make the Worker public.
   if (typeof env.BACKEND_TOKEN !== 'string' || !env.BACKEND_TOKEN.trim()) return false;
@@ -346,22 +358,11 @@ export class BackgroundBackend {
             chat.autoReply?.enabled && chat.requestBody
         )
         .map(chat => {
-          return (
-            Number(
-              chat.autoReply
-                .lastTriggerTime ||
-                chat.lastUserMessageAt ||
-                Date.now()
-            ) +
-            Math.max(
-              5,
-              Number(
-                chat.autoReply.interval ||
-                60
-              )
-            ) *
-              60000
-          );
+          const lastActivityAt = latestTimestamp(
+            chat.autoReply.lastTriggerTime,
+            chat.lastUserMessageAt
+          ) || Date.now();
+          return lastActivityAt + autoReplyIntervalMs(chat.autoReply.interval);
         });
 
       await this.setAlarmIfChanged(times.length ? Math.min(...times) : null);
@@ -470,24 +471,9 @@ export class BackgroundBackend {
         continue;
       }
 
-      const interval =
-        Math.max(
-          5,
-          Number(
-            ar.interval || 60
-          )
-        ) *
-        60 *
-        1000;
+      const interval = autoReplyIntervalMs(ar.interval);
 
-      const last = Math.max(
-        Number(
-          ar.lastTriggerTime || 0
-        ),
-        Number(
-          chat.lastUserMessageAt || 0
-        )
-      );
+      const last = latestTimestamp(ar.lastTriggerTime, chat.lastUserMessageAt) || now;
 
       const dueAt =
         last + interval;
@@ -602,12 +588,9 @@ export class BackgroundBackend {
         stateChanged = true;
       }
 
-      const next =
-        Number(
-          ar.lastTriggerTime ||
-            chat.lastUserMessageAt ||
-            now
-        ) + interval;
+      // Use the same latest activity timestamp as dueAt. Using only the older
+      // lastTriggerTime here can schedule an already-expired alarm repeatedly.
+      const next = (latestTimestamp(ar.lastTriggerTime, chat.lastUserMessageAt) || now) + interval;
 
       if (
         !nextAlarm ||
