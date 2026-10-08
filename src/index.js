@@ -49,6 +49,85 @@ export class BackgroundBackend {
   async fetch(request) {
     const url = new URL(request.url);
 
+    if (url.pathname === '/__internal/jobs/create' && request.method === 'POST') {
+      const body = await request.json();
+      const data = await this.load();
+      data.aiJobs = data.aiJobs || {};
+      if (data.aiJobs[body.jobId]) return json({ ok: true, existing: true });
+      for (const [id, job] of Object.entries(data.aiJobs)) {
+        if (Date.now() - Number(job.createdAt || 0) > 7 * 24 * 60 * 60 * 1000) delete data.aiJobs[id];
+      }
+      const retained = Object.entries(data.aiJobs).sort((a, b) => Number(b[1].createdAt || 0) - Number(a[1].createdAt || 0));
+      for (const [id] of retained.slice(100)) delete data.aiJobs[id];
+      data.aiJobs[body.jobId] = { status: 'queued', createdAt: Date.now(), aiConfig: body.aiConfig,
+        requestBody: body.requestBody, chatId: body.chatId || '', chatType: body.chatType || 'private', appUrl: body.appUrl || './' };
+      await this.save(data);
+      return json({ ok: true });
+    }
+
+    if (url.pathname === '/__internal/jobs/read' && request.method === 'GET') {
+      const data = await this.load();
+      const job = data.aiJobs?.[url.searchParams.get('jobId')];
+      return job ? json({ ok: true, job }) : json({ error: 'Job not found' }, 404);
+    }
+
+    if (url.pathname === '/__internal/jobs/claim' && request.method === 'POST') {
+      const body = await request.json();
+      const data = await this.load();
+      const job = data.aiJobs?.[body.jobId];
+      if (!job || (job.status !== 'queued' && !(job.status === 'processing' && Date.now() - Number(job.startedAt || 0) > 14 * 60 * 1000))) return json({ ok: false });
+      job.status = 'processing';
+      job.startedAt = Date.now();
+      await this.save(data);
+      return json({ ok: true, job });
+    }
+
+    if (url.pathname === '/__internal/jobs/requeue' && request.method === 'POST') {
+      const body = await request.json();
+      const data = await this.load();
+      const job = data.aiJobs?.[body.jobId];
+      if (job?.status === 'processing') { job.status = 'queued'; delete job.startedAt; await this.save(data); }
+      return json({ ok: true });
+    }
+
+    if (url.pathname === '/__internal/jobs/complete' && request.method === 'POST') {
+      const body = await request.json();
+      const data = await this.load();
+      data.aiJobs = data.aiJobs || {};
+      const job = data.aiJobs[body.jobId];
+      if (!job) return json({ error: 'Job not found' }, 404);
+      job.status = body.error ? 'failed' : 'completed';
+      job.updatedAt = Date.now();
+      if (body.error) job.error = String(body.error).slice(0, 1500);
+      else {
+        job.response = body.response;
+        const content = body.response?.choices?.[0]?.message?.content;
+        if (content) {
+          data.pendingMessages = data.pendingMessages || [];
+          data.pendingMessages.push({ id: body.jobId, chatId: job.chatId, chatType: job.chatType,
+            role: 'assistant', content: String(content), timestamp: job.updatedAt });
+          if (data.pendingMessages.length > 100) data.pendingMessages = data.pendingMessages.slice(-100);
+          // Persist the reply before sending Push so opening the app from the
+          // notification can immediately pull the completed message.
+          await this.save(data);
+          data.subscriptions = await sendToAll(this.env, data.subscriptions || [], {
+            title: 'UwU 收到新回覆', body: stripForNotification(content), url: job.appUrl,
+            chatId: job.chatId, chatType: job.chatType
+          });
+        }
+      }
+      await this.save(data);
+      return json({ ok: true });
+    }
+
+    if (url.pathname === '/__internal/jobs/ack' && request.method === 'POST') {
+      const body = await request.json();
+      const data = await this.load();
+      data.pendingMessages = (data.pendingMessages || []).filter(item => item.id !== body.jobId);
+      await this.save(data);
+      return json({ ok: true });
+    }
+
     if (
       url.pathname === '/v1/push/register' &&
       request.method === 'POST'
@@ -899,6 +978,53 @@ export default {
       });
     }
 
+    if (url.pathname.startsWith('/__internal/')) return json({ error: 'Not found' }, 404);
+
+    if (url.pathname === '/v1/ai/submit' && request.method === 'POST') {
+      if (!env.AI_QUEUE) return json({ error: 'AI_QUEUE 尚未設定；請先建立並綁定 Cloudflare Queue' }, 503);
+      try {
+        const body = await request.json();
+        const ai = body.aiConfig || {};
+        if (!body.userId || !ai.url || !ai.key || !ai.model) return json({ error: '缺少 userId 或 AI API 設定' }, 400);
+        const jobId = String(body.jobId || crypto.randomUUID());
+        if (!/^[a-zA-Z0-9_-]{8,80}$/.test(jobId)) return json({ error: '无效的 jobId' }, 400);
+        const stub = env.BACKGROUND_BACKEND.get(env.BACKGROUND_BACKEND.idFromName(String(body.userId)));
+        const saved = await stub.fetch('https://internal/__internal/jobs/create', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jobId, aiConfig: { provider: String(ai.provider || 'newapi'), url: String(ai.url).trim(),
+            key: String(ai.key).trim(), model: String(ai.model).trim() }, requestBody: body.requestBody || {},
+            chatId: body.chatId || '', chatType: body.chatType || 'private', appUrl: body.appUrl || './' })
+        });
+        if (!saved.ok) throw new Error('无法保存后台任务');
+        try {
+          await env.AI_QUEUE.send({ userId: String(body.userId), jobId });
+        } catch (error) {
+          await stub.fetch('https://internal/__internal/jobs/complete', { method: 'POST',
+            headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jobId, error: `任务排队失败：${error?.message || error}` }) });
+          throw error;
+        }
+        return json({ ok: true, jobId, status: 'queued' }, 202);
+      } catch (error) {
+        console.error('[BackgroundBackend] AI submit failed', error);
+        return json({ error: `无法建立后台 AI 任务：${error?.message || error}` }, 500);
+      }
+    }
+
+    const jobMatch = url.pathname.match(/^\/v1\/ai\/jobs\/([a-zA-Z0-9_-]{8,80})$/);
+    if (jobMatch && request.method === 'GET') {
+      const userId = url.searchParams.get('userId');
+      if (!userId) return json({ error: '缺少 userId' }, 400);
+      const stub = env.BACKGROUND_BACKEND.get(env.BACKGROUND_BACKEND.idFromName(String(userId)));
+      return stub.fetch(`https://internal/__internal/jobs/read?jobId=${encodeURIComponent(jobMatch[1])}`);
+    }
+    if (jobMatch && request.method === 'POST' && url.searchParams.get('action') === 'ack') {
+      const body = await request.json();
+      if (!body.userId) return json({ error: '缺少 userId' }, 400);
+      const stub = env.BACKGROUND_BACKEND.get(env.BACKGROUND_BACKEND.idFromName(String(body.userId)));
+      return stub.fetch('https://internal/__internal/jobs/ack', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobId: jobMatch[1] }) });
+    }
+
     // AI 请求不再经过 Durable Object。
     // UwU 每次请求都会把当前正在使用的 AI API 设置一并传过来，
     // 因此这里可以直接由 Worker 调用 AI API。
@@ -1004,6 +1130,37 @@ export default {
         },
         500
       );
+    }
+  },
+
+  async queue(batch, env) {
+    for (const message of batch.messages) {
+      const { userId, jobId } = message.body || {};
+      if (!userId || !jobId) { message.ack(); continue; }
+      const stub = env.BACKGROUND_BACKEND.get(env.BACKGROUND_BACKEND.idFromName(String(userId)));
+      try {
+        const claimed = await stub.fetch('https://internal/__internal/jobs/claim', { method: 'POST',
+          headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jobId }) });
+        if (!claimed.ok) { message.ack(); continue; }
+        const { ok, job } = await claimed.json();
+        if (!ok || !job) { message.ack(); continue; }
+        const response = await callAI(job.aiConfig, job.requestBody || {});
+        await stub.fetch('https://internal/__internal/jobs/complete', { method: 'POST',
+          headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jobId, response }) });
+        message.ack();
+      } catch (error) {
+        const detail = `后台 AI 处理失败：${error?.message || error}`;
+        console.error('[BackgroundBackend] queue AI job failed', jobId, error);
+        if (message.attempts < 3) {
+          await stub.fetch('https://internal/__internal/jobs/requeue', { method: 'POST',
+            headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jobId }) }).catch(() => {});
+          message.retry({ delaySeconds: Math.min(30, 2 ** message.attempts) });
+        } else {
+          await stub.fetch('https://internal/__internal/jobs/complete', { method: 'POST',
+            headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jobId, error: detail }) }).catch(() => {});
+          message.ack();
+        }
+      }
     }
   },
 
