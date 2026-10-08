@@ -134,6 +134,10 @@ export class BackgroundBackend {
       const body = await request.json();
       const data = await this.load();
       data.pendingMessages = (data.pendingMessages || []).filter(item => item.id !== body.jobId);
+      // The client only acknowledges after the reply has been saved locally.
+      // Drop the completed job (which contains the prompt, API config, and result)
+      // at the same time so it does not remain in Durable Object storage.
+      if (body.jobId && data.aiJobs) delete data.aiJobs[body.jobId];
       await this.save(data);
       return json({ ok: true });
     }
