@@ -526,7 +526,12 @@ export class BackgroundBackend {
                 body.messages
               )
             ) {
-              continue;
+              // 不能在这里 continue：那样会跳过下面的「更新触发时间」和「计算下一次
+              // alarm」，这个聊天就再也不会被排程，主动消息会悄悄停掉。
+              // 改为抛出错误，交给下方 catch 记录，然后照常排下一次。
+              throw new Error(
+                'requestBody.messages 格式无效，已跳过本次主动消息'
+              );
             }
 
             body.messages.push({
