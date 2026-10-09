@@ -44,19 +44,34 @@ export class BackgroundBackend {
   }
 
   async load() {
-    return (
-      (await this.state.storage.get('data')) || {
+    const stored = await this.state.storage.get('data');
+    if (stored?.__uwuEncoding === 'gzip-json-v1' && stored.payload) {
+      const stream = new Blob([stored.payload]).stream().pipeThrough(new DecompressionStream('gzip'));
+      return JSON.parse(await new Response(stream).text());
+    }
+    return stored || {
         subscriptions: [],
         chats: {},
         proactive: {},
         pendingMessages: [],
         aiConfig: null
       }
-    );
   }
 
   async save(data) {
-    await this.state.storage.put('data', data);
+    const raw = new TextEncoder().encode(JSON.stringify(data));
+    // The complete backend state is stored under one DO key. Compress larger
+    // states before they approach SQLite's 2 MB per-value/row limit.
+    if (raw.byteLength <= 256 * 1024) {
+      await this.state.storage.put('data', data);
+      return;
+    }
+    const compressedStream = new Blob([raw]).stream().pipeThrough(new CompressionStream('gzip'));
+    const payload = new Uint8Array(await new Response(compressedStream).arrayBuffer());
+    if (payload.byteLength > 1_900_000) {
+      throw new Error(`后台储存仍过大（压缩后 ${payload.byteLength} bytes）；请缩短提示词或聊天上下文后重试`);
+    }
+    await this.state.storage.put('data', { __uwuEncoding: 'gzip-json-v1', payload });
   }
 
   async setAlarmIfChanged(timestamp) {
@@ -94,7 +109,13 @@ export class BackgroundBackend {
     if (url.pathname === '/__internal/jobs/read' && request.method === 'GET') {
       const data = await this.load();
       const job = data.aiJobs?.[url.searchParams.get('jobId')];
-      return job ? json({ ok: true, job }) : json({ error: 'Job not found' }, 404);
+      if (!job) return json({ error: 'Job not found' }, 404);
+      const publicJob = { ...job };
+      if (publicJob.status === 'completed' || publicJob.status === 'failed') {
+        delete publicJob.requestBody;
+        delete publicJob.aiConfig;
+      }
+      return json({ ok: true, job: publicJob });
     }
 
     if (url.pathname === '/__internal/jobs/claim' && request.method === 'POST') {
@@ -125,6 +146,10 @@ export class BackgroundBackend {
       let savedBeforePush = false;
       job.status = body.error ? 'failed' : 'completed';
       job.updatedAt = Date.now();
+      // The Queue consumer has finished; retaining the full prompt history and
+      // API key in every completed job only bloats Durable Object storage.
+      delete job.requestBody;
+      delete job.aiConfig;
       if (body.error) job.error = String(body.error).slice(0, 1500);
       else {
         job.response = body.response;
@@ -166,7 +191,9 @@ export class BackgroundBackend {
       const data = await this.load();
       const pendingMessages = data.pendingMessages || [];
       const remainingMessages = pendingMessages.filter(item => item.id !== body.jobId);
-      if (remainingMessages.length !== pendingMessages.length) {
+      const hadJob = !!data.aiJobs?.[body.jobId];
+      if (data.aiJobs) delete data.aiJobs[body.jobId];
+      if (remainingMessages.length !== pendingMessages.length || hadJob) {
         data.pendingMessages = remainingMessages;
         await this.save(data);
       }
@@ -220,7 +247,14 @@ export class BackgroundBackend {
         const data = await this.load();
         const pendingMessages = data.pendingMessages || [];
         const remainingMessages = pendingMessages.filter(item => !ids.has(String(item.id)));
-        if (remainingMessages.length !== pendingMessages.length) {
+        let removedJobs = false;
+        for (const id of ids) {
+          if (data.aiJobs?.[id]) {
+            delete data.aiJobs[id];
+            removedJobs = true;
+          }
+        }
+        if (remainingMessages.length !== pendingMessages.length || removedJobs) {
           data.pendingMessages = remainingMessages;
           await this.save(data);
         }
@@ -526,12 +560,7 @@ export class BackgroundBackend {
                 body.messages
               )
             ) {
-              // 不能在这里 continue：那样会跳过下面的「更新触发时间」和「计算下一次
-              // alarm」，这个聊天就再也不会被排程，主动消息会悄悄停掉。
-              // 改为抛出错误，交给下方 catch 记录，然后照常排下一次。
-              throw new Error(
-                'requestBody.messages 格式无效，已跳过本次主动消息'
-              );
+              continue;
             }
 
             body.messages.push({
