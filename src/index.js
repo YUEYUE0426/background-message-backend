@@ -395,6 +395,20 @@ export class BackgroundBackend {
       return json({ ok: true });
     }
 
+    if (url.pathname === '/v1/backend/disable' && request.method === 'POST') {
+      const data = await this.load();
+      let changed = Object.keys(data.proactive || {}).length > 0;
+      data.proactive = {};
+      for (const chat of Object.values(data.chats || {})) {
+        if (chat.autoReply?.enabled || chat.requestBody) changed = true;
+        if (chat.autoReply) chat.autoReply.enabled = false;
+        chat.requestBody = null;
+      }
+      if (changed) await this.save(data);
+      await this.setAlarmIfChanged(null);
+      return json({ ok: true, stopped: true });
+    }
+
     if (
       url.pathname === '/v1/ai' &&
       request.method === 'POST'
