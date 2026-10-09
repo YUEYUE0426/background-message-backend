@@ -326,7 +326,11 @@ export class BackgroundBackend {
 
       data.chats = data.chats || {};
 
-      data.chats[body.chatId] = {
+      const previousChat = data.chats[body.chatId] || {};
+      const autoReply = body.autoReply || previousChat.autoReply || {
+        enabled: false
+      };
+      const nextChat = {
         chatType:
           body.chatType || 'private',
         realName:
@@ -338,17 +342,22 @@ export class BackgroundBackend {
         myName:
           body.myName || '用户',
         requestBody:
-          body.requestBody || null,
-        autoReply:
-          body.autoReply || {
-            enabled: false
-          },
-        lastUserMessageAt: Date.now(),
+          autoReply.enabled ? (body.requestBody || previousChat.requestBody || null) : null,
+        autoReply,
+        lastUserMessageAt: autoReply.enabled
+          ? Date.now()
+          : Number(previousChat.lastUserMessageAt || 0),
         appUrl:
           body.appUrl || './'
       };
 
-      await this.save(data);
+      // A normal manual AI reply does not need its full prompt history stored
+      // in the Worker. Keep that context only for chats using Worker auto-reply,
+      // and avoid a Durable Object write when the synchronized state is equal.
+      if (JSON.stringify(previousChat) !== JSON.stringify(nextChat)) {
+        data.chats[body.chatId] = nextChat;
+        await this.save(data);
+      }
 
       const times = Object.values(
         data.chats
