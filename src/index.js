@@ -424,6 +424,8 @@ export class BackgroundBackend {
       if (!job) return json({ error: 'Job not found' }, 404);
       // 用户已取消：丢弃结果，不保存回复、不推送通知。
       if (job.status === 'cancelled') return json({ ok: true, cancelled: true });
+      // 重复完成（重试等）：已有结果就不再保存/推送第二次。
+      if (job.status === 'completed' || job.status === 'failed') return json({ ok: true, duplicate: true });
       const requestParts = job.reqParts || 0;
       job.status = body.error ? 'failed' : 'completed';
       job.updatedAt = Date.now();
