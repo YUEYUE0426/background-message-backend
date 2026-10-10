@@ -151,13 +151,58 @@ function trimAutoReplyBody(body) {
   return { ...body, messages };
 }
 
+// ===== 安静时段 =====
+// qh = { enabled, start:'HH:MM', end:'HH:MM', timezone:'Asia/Shanghai' }；start > end 表示跨天。
+function quietMinutes(text, fallback) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(text || ''));
+  if (!m) return fallback;
+  const v = Number(m[1]) * 60 + Number(m[2]);
+  return v >= 0 && v < 1440 ? v : fallback;
+}
+
+// 返回 { start, end, tz }；未启用或设置无效时返回 null（无效时区视为 UTC）。
+function parseQuietHours(qh) {
+  if (!qh || !qh.enabled) return null;
+  const start = quietMinutes(qh.start, 0);
+  const end = quietMinutes(qh.end, 480);
+  if (start === end) return null;
+  let tz = typeof qh.timezone === 'string' && qh.timezone ? qh.timezone : 'UTC';
+  try { new Intl.DateTimeFormat('en-GB', { timeZone: tz }); } catch { tz = 'UTC'; }
+  return { start, end, tz };
+}
+
+function localMinutes(tz, t) {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: tz, hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+  }).formatToParts(new Date(t));
+  return Number(parts.find(p => p.type === 'hour').value) * 60 + Number(parts.find(p => p.type === 'minute').value);
+}
+
+function isQuietAt(qh, t) {
+  const q = parseQuietHours(qh);
+  if (!q) return false;
+  const m = localMinutes(q.tz, t);
+  return q.start < q.end ? (m >= q.start && m < q.end) : (m >= q.start || m < q.end);
+}
+
+// 若 t 落在安静时段内，返回该时段结束的时间；否则原样返回 t。
+function skipQuiet(qh, t) {
+  const q = parseQuietHours(qh);
+  if (!q || !isQuietAt(qh, t)) return t;
+  const m = localMinutes(q.tz, t);
+  const remain = ((q.end - m) + 1440) % 1440 || 1440;
+  return t - (t % 60000) + remain * 60000;
+}
+
 // 下一次 alarm 的时间；没有需要排程的聊天时返回 null。
 function computeNextAlarm(meta, now = Date.now()) {
   let next = 0;
   for (const chat of Object.values(meta.chats || {})) {
     const ar = chat.autoReply;
     if (!ar || !ar.enabled || !(chat.bodyParts > 0)) continue;
-    const at = (latestTimestamp(ar.lastTriggerTime, chat.lastUserMessageAt) || now) + autoReplyIntervalMs(ar.interval);
+    let at = (latestTimestamp(ar.lastTriggerTime, chat.lastUserMessageAt) || now) + autoReplyIntervalMs(ar.interval);
+    // 落在安静时段内就顺延到时段结束（已过期的按当前时间判断）
+    { const probe = Math.max(at, now); const shifted = skipQuiet(ar.quietHours, probe); if (shifted !== probe) at = shifted; }
     if (!next || at < next) next = at;
   }
   return next || null;
@@ -760,6 +805,9 @@ export class BackgroundBackend {
         last + interval;
 
       if (dueAt > now) continue;
+
+      // 安静时段：不调用 AI、不推送、不更新触发时间，等时段结束后由 computeNextAlarm 重新排程。
+      if (isQuietAt(ar.quietHours, now)) continue;
 
       const result = {
         chatId,
