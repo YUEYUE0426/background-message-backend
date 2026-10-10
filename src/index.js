@@ -37,41 +37,280 @@ function checkAuth(request, env) {
   return auth === `Bearer ${env.BACKEND_TOKEN.trim()}`;
 }
 
+// ===================== 存储布局（v2）=====================
+// Durable Object（SQLite 版）单个值（key + value）上限 2 MB。
+// 旧版把所有东西塞进同一个 key（data），任务记录和自动回复历史越积越多，
+// 超过 2 MB 后所有写入都会失败。现在拆开存，每个值都很小：
+//   meta                  订阅、聊天设置、未读消息、AI 设置
+//   body:<chatId>:<n>     开了自动回复的聊天的请求内容（已裁剪，按块存）
+//   job:<jobId>           AI 任务的状态与回复
+//   jobreq:<jobId>:<n>    AI 任务的请求内容（按块存，任务结束就删除）
+// 旧版的 data 会在第一次访问时自动迁移。
+const STORAGE_CHUNK_CHARS = 400000; // 每块字符数，远低于 2 MB（中文按 3 字节算也只有约 1.2 MB）
+const MAX_JOBS = 100; // 最多保留的 AI 任务记录
+const JOB_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 任务记录保留时间
+const MAX_PENDING_MESSAGES = 100; // 未读消息最多条数
+const MAX_PENDING_CHARS = 600000; // 未读消息总字数上限
+const AUTO_REPLY_MAX_MESSAGES = 80; // 自动回复保留的非 system 消息条数
+const AUTO_REPLY_MAX_CHARS = 400000; // 自动回复请求内容总字数上限
+
+function emptyMeta() {
+  return {
+    v: 2,
+    subscriptions: [],
+    chats: {},
+    proactive: {},
+    pendingMessages: [],
+    aiConfig: null,
+    jobs: {}
+  };
+}
+
+function normalizeMeta(meta) {
+  const base = emptyMeta();
+  const result = { ...base, ...(meta || {}) };
+  result.subscriptions = Array.isArray(result.subscriptions) ? result.subscriptions : [];
+  result.chats = result.chats && typeof result.chats === 'object' ? result.chats : {};
+  result.proactive = result.proactive && typeof result.proactive === 'object' ? result.proactive : {};
+  result.pendingMessages = Array.isArray(result.pendingMessages) ? result.pendingMessages : [];
+  result.jobs = result.jobs && typeof result.jobs === 'object' ? result.jobs : {};
+  return result;
+}
+
+function subscriptionEndpoint(item) {
+  return item?.subscription?.endpoint || item?.endpoint || '';
+}
+
+function bodyKey(chatId) {
+  return `body:${String(chatId).slice(0, 300)}`;
+}
+
+function jobKey(jobId) {
+  return `job:${jobId}`;
+}
+
+function jobRequestKey(jobId) {
+  return `jobreq:${jobId}`;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// 限制未读消息的条数和总量，只丢最旧的。
+function limitPendingMessages(list) {
+  let messages = (Array.isArray(list) ? list : []).slice(-MAX_PENDING_MESSAGES);
+  while (messages.length > 1 && JSON.stringify(messages).length > MAX_PENDING_CHARS) {
+    messages = messages.slice(1);
+  }
+  return messages;
+}
+
+// 裁剪自动回复要保存的请求内容：
+// 1. 图片只在当次对话需要，主动消息用不到，换成文字占位，避免体积暴增；
+// 2. 所有 system 消息都保留（人设、世界书、CoT 指令等），其余只留最近的若干条；
+// 3. 仍然太大时继续丢掉最旧的对话，至少保留最后几条。
+function trimAutoReplyBody(body) {
+  if (!body || !Array.isArray(body.messages)) return body;
+
+  let messages = body.messages.map(message => {
+    if (message && Array.isArray(message.content)) {
+      return {
+        ...message,
+        content: message.content.map(part =>
+          part && part.type === 'image_url' ? { type: 'text', text: '[图片已省略]' } : part
+        )
+      };
+    }
+    return message;
+  });
+
+  const keep = new Set();
+  let kept = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === 'system') {
+      keep.add(i);
+    } else if (kept < AUTO_REPLY_MAX_MESSAGES) {
+      keep.add(i);
+      kept++;
+    }
+  }
+  messages = messages.filter((_, index) => keep.has(index));
+
+  const conversationCount = () => messages.filter(message => message?.role !== 'system').length;
+  while (JSON.stringify(messages).length > AUTO_REPLY_MAX_CHARS && conversationCount() > 4) {
+    messages.splice(messages.findIndex(message => message?.role !== 'system'), 1);
+  }
+
+  // 对话部分不要以 assistant 开头（部分 API 要求第一条是 user）。
+  const first = messages.findIndex(message => message?.role !== 'system');
+  if (first !== -1 && messages[first]?.role === 'assistant' && conversationCount() > 1) {
+    messages.splice(first, 1);
+  }
+
+  return { ...body, messages };
+}
+
+// 下一次 alarm 的时间；没有需要排程的聊天时返回 null。
+function computeNextAlarm(meta, now = Date.now()) {
+  let next = 0;
+  for (const chat of Object.values(meta.chats || {})) {
+    const ar = chat.autoReply;
+    if (!ar || !ar.enabled || !(chat.bodyParts > 0)) continue;
+    const at = (latestTimestamp(ar.lastTriggerTime, chat.lastUserMessageAt) || now) + autoReplyIntervalMs(ar.interval);
+    if (!next || at < next) next = at;
+  }
+  return next || null;
+}
+
+// 返回给 App 查询的任务信息：不含请求内容和 API Key。
+function publicJob(job) {
+  return {
+    jobId: job.jobId,
+    status: job.status,
+    error: job.error,
+    response: job.response,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    chatId: job.chatId,
+    chatType: job.chatType
+  };
+}
+
 export class BackgroundBackend {
   constructor(state, env) {
     this.state = state;
     this.env = env;
   }
 
-  async load() {
-    const stored = await this.state.storage.get('data');
-    if (stored?.__uwuEncoding === 'gzip-json-v1' && stored.payload) {
-      const stream = new Blob([stored.payload]).stream().pipeThrough(new DecompressionStream('gzip'));
-      return JSON.parse(await new Response(stream).text());
-    }
-    return stored || {
-        subscriptions: [],
-        chats: {},
-        proactive: {},
-        pendingMessages: [],
-        aiConfig: null
+  // ---------- 大对象：按块存取，避免单个值超过 2 MB ----------
+
+  async putBig(key, value) {
+    const text = JSON.stringify(value === undefined ? null : value);
+    const entries = {};
+    let parts = 0;
+    let start = 0;
+    do {
+      let end = Math.min(text.length, start + STORAGE_CHUNK_CHARS);
+      // 不要把一个 emoji（代理对）切成两半。
+      if (end < text.length) {
+        const code = text.charCodeAt(end - 1);
+        if (code >= 0xd800 && code <= 0xdbff) end++;
       }
+      entries[`${key}:${parts}`] = text.slice(start, end);
+      parts++;
+      start = end;
+    } while (start < text.length);
+    await this.state.storage.put(entries);
+    return parts;
   }
 
-  async save(data) {
-    const raw = new TextEncoder().encode(JSON.stringify(data));
-    // The complete backend state is stored under one DO key. Compress larger
-    // states before they approach SQLite's 2 MB per-value/row limit.
-    if (raw.byteLength <= 256 * 1024) {
-      await this.state.storage.put('data', data);
-      return;
+  async getBig(key, parts) {
+    if (!(parts > 0)) return null;
+    const keys = Array.from({ length: parts }, (_, index) => `${key}:${index}`);
+    const stored = await this.state.storage.get(keys);
+    let text = '';
+    for (const part of keys) {
+      const piece = stored.get(part);
+      if (typeof piece !== 'string') throw new Error(`存储数据不完整：${part}`);
+      text += piece;
     }
-    const compressedStream = new Blob([raw]).stream().pipeThrough(new CompressionStream('gzip'));
-    const payload = new Uint8Array(await new Response(compressedStream).arrayBuffer());
-    if (payload.byteLength > 1_900_000) {
-      throw new Error(`后台储存仍过大（压缩后 ${payload.byteLength} bytes）；请缩短提示词或聊天上下文后重试`);
+    return JSON.parse(text);
+  }
+
+  async deleteBig(key, parts) {
+    if (!(parts > 0)) return;
+    const keys = Array.from({ length: parts }, (_, index) => `${key}:${index}`);
+    await this.state.storage.delete(keys);
+  }
+
+  // ---------- meta ----------
+
+  async loadMeta() {
+    const stored = await this.state.storage.get('meta');
+    if (stored) return normalizeMeta(stored);
+    const legacy = await this.state.storage.get('data');
+    if (legacy) return this.migrateLegacy(legacy);
+    return emptyMeta();
+  }
+
+  async saveMeta(meta) {
+    await this.state.storage.put('meta', meta);
+  }
+
+  // 把旧版单个 data 拆成新布局。可重复执行：最后才写 meta 并删除 data。
+  async migrateLegacy(legacy) {
+    const meta = emptyMeta();
+    meta.subscriptions = Array.isArray(legacy.subscriptions) ? legacy.subscriptions : [];
+    meta.proactive = legacy.proactive || {};
+    meta.aiConfig = legacy.aiConfig || null;
+    meta.pendingMessages = limitPendingMessages(legacy.pendingMessages);
+
+    for (const [chatId, chat] of Object.entries(legacy.chats || {})) {
+      const { requestBody, ...rest } = chat || {};
+      meta.chats[chatId] = { ...rest, bodyParts: 0, bodyRev: 0 };
+      if (requestBody && rest.autoReply?.enabled) {
+        meta.chats[chatId].bodyParts = await this.putBig(bodyKey(chatId), trimAutoReplyBody(requestBody));
+      }
     }
-    await this.state.storage.put('data', { __uwuEncoding: 'gzip-json-v1', payload });
+
+    const jobs = Object.entries(legacy.aiJobs || {})
+      .sort((a, b) => Number(b[1]?.createdAt || 0) - Number(a[1]?.createdAt || 0))
+      .slice(0, MAX_JOBS);
+    for (const [jobId, job] of jobs) {
+      const { requestBody, ...rest } = job || {};
+      rest.jobId = rest.jobId || jobId;
+      rest.reqParts = 0;
+      if (rest.status === 'queued' || rest.status === 'processing') {
+        // 还没处理完的任务保留请求内容，让队列继续完成。
+        rest.reqParts = await this.putBig(jobRequestKey(jobId), requestBody || {});
+      } else {
+        // 已结束的任务不再需要请求内容和 API Key。
+        delete rest.aiConfig;
+      }
+      await this.state.storage.put(jobKey(jobId), rest);
+      meta.jobs[jobId] = Number(rest.createdAt || 0);
+    }
+
+    await this.saveMeta(meta);
+    await this.state.storage.delete('data');
+    return meta;
+  }
+
+  // 删除过期或超出数量的任务记录（连同请求内容）。
+  async pruneJobs(meta, keepRoom = 1) {
+    const now = Date.now();
+    const entries = Object.entries(meta.jobs).sort((a, b) => b[1] - a[1]);
+    const removeIds = [];
+    entries.forEach(([jobId, createdAt], index) => {
+      if (now - createdAt > JOB_TTL_MS || index >= MAX_JOBS - keepRoom) removeIds.push(jobId);
+    });
+    for (const jobId of removeIds) {
+      const job = await this.state.storage.get(jobKey(jobId));
+      await this.deleteBig(jobRequestKey(jobId), job?.reqParts || 0);
+      await this.state.storage.delete(jobKey(jobId));
+      delete meta.jobs[jobId];
+    }
+  }
+
+  // 依次发送一批通知；返回被判定失效、应从订阅里移除的 endpoint。
+  async pushAll(subscriptions, payloads, stats = null) {
+    let current = subscriptions || [];
+    for (let index = 0; index < payloads.length; index++) {
+      if (index > 0) await sleep(350);
+      current = await sendToAll(this.env, current, payloads[index], stats);
+    }
+    const kept = new Set(current.map(subscriptionEndpoint));
+    return new Set((subscriptions || []).map(subscriptionEndpoint).filter(endpoint => !kept.has(endpoint)));
+  }
+
+  // 发送通知期间别的请求可能已改过订阅，所以重新读取后只删除失效的那几条。
+  async removeSubscriptions(removed) {
+    if (!removed || !removed.size) return;
+    const meta = await this.loadMeta();
+    const before = meta.subscriptions.length;
+    meta.subscriptions = meta.subscriptions.filter(item => !removed.has(subscriptionEndpoint(item)));
+    if (meta.subscriptions.length !== before) await this.saveMeta(meta);
   }
 
   async setAlarmIfChanged(timestamp) {
@@ -90,112 +329,101 @@ export class BackgroundBackend {
 
     if (url.pathname === '/__internal/jobs/create' && request.method === 'POST') {
       const body = await request.json();
-      const data = await this.load();
-      data.aiJobs = data.aiJobs || {};
-      if (data.aiJobs[body.jobId]) return json({ ok: true, existing: true });
-      for (const [id, job] of Object.entries(data.aiJobs)) {
-        if (Date.now() - Number(job.createdAt || 0) > 7 * 24 * 60 * 60 * 1000) delete data.aiJobs[id];
-      }
-      const retained = Object.entries(data.aiJobs).sort((a, b) => Number(b[1].createdAt || 0) - Number(a[1].createdAt || 0));
-      for (const [id] of retained.slice(100)) delete data.aiJobs[id];
-      data.aiJobs[body.jobId] = { status: 'queued', createdAt: Date.now(), aiConfig: body.aiConfig,
-        requestBody: body.requestBody, chatId: body.chatId || '', chatType: body.chatType || 'private',
-        chatName: String(body.chatName || data.chats?.[body.chatId]?.remarkName || data.chats?.[body.chatId]?.realName || '').slice(0, 120),
-        chatStatusRegex: String(body.chatStatusRegex || data.chats?.[body.chatId]?.statusRegex || '').slice(0, 500), appUrl: body.appUrl || './' };
-      await this.save(data);
+      if (await this.state.storage.get(jobKey(body.jobId))) return json({ ok: true, existing: true });
+      const meta = await this.loadMeta();
+      await this.pruneJobs(meta);
+      const reqParts = await this.putBig(jobRequestKey(body.jobId), body.requestBody || {});
+      const createdAt = Date.now();
+      await this.state.storage.put(jobKey(body.jobId), {
+        jobId: body.jobId, status: 'queued', createdAt, aiConfig: body.aiConfig, reqParts,
+        chatId: body.chatId || '', chatType: body.chatType || 'private',
+        chatName: String(body.chatName || meta.chats?.[body.chatId]?.remarkName || meta.chats?.[body.chatId]?.realName || '').slice(0, 120),
+        chatStatusRegex: String(body.chatStatusRegex || meta.chats?.[body.chatId]?.statusRegex || '').slice(0, 500),
+        appUrl: body.appUrl || './'
+      });
+      meta.jobs[body.jobId] = createdAt;
+      await this.saveMeta(meta);
       return json({ ok: true });
     }
 
     if (url.pathname === '/__internal/jobs/read' && request.method === 'GET') {
-      const data = await this.load();
-      const job = data.aiJobs?.[url.searchParams.get('jobId')];
-      if (!job) return json({ error: 'Job not found' }, 404);
-      const publicJob = { ...job };
-      if (publicJob.status === 'completed' || publicJob.status === 'failed') {
-        delete publicJob.requestBody;
-        delete publicJob.aiConfig;
-      }
-      return json({ ok: true, job: publicJob });
+      const job = await this.state.storage.get(jobKey(url.searchParams.get('jobId')));
+      return job ? json({ ok: true, job: publicJob(job) }) : json({ error: 'Job not found' }, 404);
     }
 
     if (url.pathname === '/__internal/jobs/claim' && request.method === 'POST') {
       const body = await request.json();
-      const data = await this.load();
-      const job = data.aiJobs?.[body.jobId];
+      const job = await this.state.storage.get(jobKey(body.jobId));
       if (!job || (job.status !== 'queued' && !(job.status === 'processing' && Date.now() - Number(job.startedAt || 0) > 14 * 60 * 1000))) return json({ ok: false });
+      const requestBody = (await this.getBig(jobRequestKey(body.jobId), job.reqParts)) || {};
       job.status = 'processing';
       job.startedAt = Date.now();
-      await this.save(data);
-      return json({ ok: true, job });
+      await this.state.storage.put(jobKey(body.jobId), job);
+      return json({ ok: true, job: { ...job, requestBody } });
     }
 
     if (url.pathname === '/__internal/jobs/requeue' && request.method === 'POST') {
       const body = await request.json();
-      const data = await this.load();
-      const job = data.aiJobs?.[body.jobId];
-      if (job?.status === 'processing') { job.status = 'queued'; delete job.startedAt; await this.save(data); }
+      const job = await this.state.storage.get(jobKey(body.jobId));
+      if (job?.status === 'processing') {
+        job.status = 'queued';
+        delete job.startedAt;
+        await this.state.storage.put(jobKey(body.jobId), job);
+      }
       return json({ ok: true });
     }
 
     if (url.pathname === '/__internal/jobs/complete' && request.method === 'POST') {
       const body = await request.json();
-      const data = await this.load();
-      data.aiJobs = data.aiJobs || {};
-      const job = data.aiJobs[body.jobId];
+      const job = await this.state.storage.get(jobKey(body.jobId));
       if (!job) return json({ error: 'Job not found' }, 404);
-      let savedBeforePush = false;
+      const requestParts = job.reqParts || 0;
       job.status = body.error ? 'failed' : 'completed';
       job.updatedAt = Date.now();
-      // The Queue consumer has finished; retaining the full prompt history and
-      // API key in every completed job only bloats Durable Object storage.
-      delete job.requestBody;
+      // 任务结束后请求内容和 API Key 都不再需要，立刻清掉。
       delete job.aiConfig;
+      job.reqParts = 0;
       if (body.error) job.error = String(body.error).slice(0, 1500);
-      else {
-        job.response = body.response;
-        const content = body.response?.choices?.[0]?.message?.content;
-        if (content) {
-          data.pendingMessages = data.pendingMessages || [];
-          data.pendingMessages.push({ id: body.jobId, chatId: job.chatId, chatType: job.chatType,
-            role: 'assistant', content: String(content), timestamp: job.updatedAt });
-          if (data.pendingMessages.length > 100) data.pendingMessages = data.pendingMessages.slice(-100);
-          // Persist the reply before sending Push so opening the app from the
-          // notification can immediately pull the completed message.
-          await this.save(data);
-          savedBeforePush = true;
-          const notificationMessages = splitNotificationMessages(content, job.chatStatusRegex || data.chats?.[job.chatId]?.statusRegex || '');
-          const title = job.chatName || data.chats?.[job.chatId]?.remarkName || data.chats?.[job.chatId]?.realName || '新消息';
-          const subscriptionEndpointsBefore = JSON.stringify((data.subscriptions || []).map(item => item.subscription?.endpoint || item.endpoint || ''));
-          for (let index = 0; index < notificationMessages.length; index++) {
-            if (index > 0) await new Promise(resolve => setTimeout(resolve, 350));
-            data.subscriptions = await sendToAll(this.env, data.subscriptions || [], {
-              title,
-              body: notificationMessages[index],
-              tag: `uwu-${job.jobId || body.jobId}-${index}`,
-              url: job.appUrl,
-              chatId: job.chatId, chatType: job.chatType
-            });
-          }
-          const subscriptionEndpointsAfter = JSON.stringify((data.subscriptions || []).map(item => item.subscription?.endpoint || item.endpoint || ''));
-          // The reply was already persisted. Write again only when expired push
-          // subscriptions were removed while delivering the notification.
-          if (subscriptionEndpointsBefore !== subscriptionEndpointsAfter) await this.save(data);
-        }
+      else job.response = body.response;
+      await this.state.storage.put(jobKey(body.jobId), job);
+      await this.deleteBig(jobRequestKey(body.jobId), requestParts);
+
+      const content = body.error ? '' : body.response?.choices?.[0]?.message?.content;
+      if (content) {
+        // 先保存回复再发 Push，这样从通知点进 App 时可以马上拉到这条消息。
+        const meta = await this.loadMeta();
+        meta.pendingMessages.push({ id: body.jobId, chatId: job.chatId, chatType: job.chatType,
+          role: 'assistant', content: String(content), timestamp: job.updatedAt });
+        meta.pendingMessages = limitPendingMessages(meta.pendingMessages);
+        await this.saveMeta(meta);
+
+        const notificationMessages = splitNotificationMessages(content, job.chatStatusRegex || meta.chats?.[job.chatId]?.statusRegex || '');
+        const title = job.chatName || meta.chats?.[job.chatId]?.remarkName || meta.chats?.[job.chatId]?.realName || '新消息';
+        const removed = await this.pushAll(meta.subscriptions, notificationMessages.map((text, index) => ({
+          title,
+          body: text,
+          tag: `uwu-${job.jobId || body.jobId}-${index}`,
+          url: job.appUrl,
+          chatId: job.chatId, chatType: job.chatType
+        })));
+        await this.removeSubscriptions(removed);
       }
-      if (!savedBeforePush) await this.save(data);
       return json({ ok: true });
     }
 
     if (url.pathname === '/__internal/jobs/ack' && request.method === 'POST') {
       const body = await request.json();
-      const data = await this.load();
-      const pendingMessages = data.pendingMessages || [];
-      const remainingMessages = pendingMessages.filter(item => item.id !== body.jobId);
-      const hadJob = !!data.aiJobs?.[body.jobId];
-      if (data.aiJobs) delete data.aiJobs[body.jobId];
-      if (remainingMessages.length !== pendingMessages.length || hadJob) {
-        data.pendingMessages = remainingMessages;
-        await this.save(data);
+      const meta = await this.loadMeta();
+      const remainingMessages = meta.pendingMessages.filter(item => item.id !== body.jobId);
+      if (remainingMessages.length !== meta.pendingMessages.length) {
+        meta.pendingMessages = remainingMessages;
+        await this.saveMeta(meta);
+      }
+      // App 已经拿到回复，任务里的回复内容不用再留着，只保留状态。
+      const job = await this.state.storage.get(jobKey(body.jobId));
+      if (job && job.response !== undefined) {
+        delete job.response;
+        await this.state.storage.put(jobKey(body.jobId), job);
       }
       return json({ ok: true });
     }
@@ -205,24 +433,24 @@ export class BackgroundBackend {
       request.method === 'POST'
     ) {
       const body = await request.json();
-      const data = await this.load();
+      const meta = await this.loadMeta();
 
-      data.subscriptions = (data.subscriptions || [])
+      meta.subscriptions = meta.subscriptions
         .filter(
           item =>
-            (item.subscription?.endpoint || item.endpoint) !==
+            subscriptionEndpoint(item) !==
             body.subscription?.endpoint
         );
 
       if (body.subscription) {
-        data.subscriptions.push({
+        meta.subscriptions.push({
           subscription: body.subscription,
           appUrl: body.appUrl || './',
           timezone: body.timezone || 'UTC'
         });
       }
 
-      await this.save(data);
+      await this.saveMeta(meta);
 
       return json({ ok: true });
     }
@@ -231,12 +459,11 @@ export class BackgroundBackend {
       url.pathname === '/v1/messages/pull' &&
       request.method === 'GET'
     ) {
-      const data = await this.load();
-      const messages = data.pendingMessages || [];
+      const meta = await this.loadMeta();
 
       return json({
         ok: true,
-        messages
+        messages: meta.pendingMessages
       });
     }
 
@@ -244,19 +471,11 @@ export class BackgroundBackend {
       const body = await request.json();
       const ids = new Set(Array.isArray(body.ids) ? body.ids.map(String) : []);
       if (ids.size) {
-        const data = await this.load();
-        const pendingMessages = data.pendingMessages || [];
-        const remainingMessages = pendingMessages.filter(item => !ids.has(String(item.id)));
-        let removedJobs = false;
-        for (const id of ids) {
-          if (data.aiJobs?.[id]) {
-            delete data.aiJobs[id];
-            removedJobs = true;
-          }
-        }
-        if (remainingMessages.length !== pendingMessages.length || removedJobs) {
-          data.pendingMessages = remainingMessages;
-          await this.save(data);
+        const meta = await this.loadMeta();
+        const remainingMessages = meta.pendingMessages.filter(item => !ids.has(String(item.id)));
+        if (remainingMessages.length !== meta.pendingMessages.length) {
+          meta.pendingMessages = remainingMessages;
+          await this.saveMeta(meta);
         }
       }
       return json({ ok: true });
@@ -267,30 +486,26 @@ export class BackgroundBackend {
       request.method === 'POST'
     ) {
       const body = await request.json();
-      const data = await this.load();
-      if (!(data.subscriptions || []).length) return json({ error: '这台设备还没有注册后台通知' }, 400);
-      const subscriptionEndpointsBefore = JSON.stringify((data.subscriptions || []).map(item => item.subscription?.endpoint || item.endpoint || ''));
+      const meta = await this.loadMeta();
+      if (!meta.subscriptions.length) return json({ error: '这台设备还没有注册后台通知' }, 400);
       const pushStats = { sent: 0, failed: 0, errors: [] };
-      data.subscriptions = await sendToAll(
-        this.env,
-        data.subscriptions || [],
-        {
+      const removed = await this.pushAll(
+        meta.subscriptions,
+        [{
           title: body.title || '后台通知',
           body: body.body || '后台通知测试成功',
           url: body.url || './'
-        },
+        }],
         pushStats
       );
-
-      const subscriptionEndpointsAfter = JSON.stringify((data.subscriptions || []).map(item => item.subscription?.endpoint || item.endpoint || ''));
-      if (subscriptionEndpointsBefore !== subscriptionEndpointsAfter) await this.save(data);
+      await this.removeSubscriptions(removed);
 
       if (!pushStats.sent) return json({
         error: `推送发送失败（失败数：${pushStats.failed}）`,
         failures: pushStats.errors.slice(0, 5)
       }, 502);
 
-      return json({ ok: true, sent: pushStats.sent, subscriptions: data.subscriptions.length });
+      return json({ ok: true, sent: pushStats.sent, subscriptions: meta.subscriptions.length - removed.size });
     }
 
     // 保存当前应用中的 AI API 设置。
@@ -299,7 +514,7 @@ export class BackgroundBackend {
       request.method === 'POST'
     ) {
       const body = await request.json();
-      const data = await this.load();
+      const meta = await this.loadMeta();
       const ai = body.aiConfig || {};
 
       if (
@@ -325,9 +540,9 @@ export class BackgroundBackend {
         model: String(ai.model).trim()
       };
 
-      if (JSON.stringify(data.aiConfig) !== JSON.stringify(nextAiConfig)) {
-        data.aiConfig = nextAiConfig;
-        await this.save(data);
+      if (JSON.stringify(meta.aiConfig) !== JSON.stringify(nextAiConfig)) {
+        meta.aiConfig = nextAiConfig;
+        await this.saveMeta(meta);
       }
 
       return json({
@@ -341,14 +556,15 @@ export class BackgroundBackend {
       request.method === 'POST'
     ) {
       const body = await request.json();
-      const data = await this.load();
+      const meta = await this.loadMeta();
+      let metaChanged = false;
 
       if (
         body.aiConfig?.url &&
         body.aiConfig?.key &&
         body.aiConfig?.model
       ) {
-        data.aiConfig = {
+        const nextAiConfig = {
           provider: String(
             body.aiConfig.provider || 'newapi'
           ),
@@ -356,11 +572,13 @@ export class BackgroundBackend {
           key: String(body.aiConfig.key).trim(),
           model: String(body.aiConfig.model).trim()
         };
+        if (JSON.stringify(meta.aiConfig) !== JSON.stringify(nextAiConfig)) {
+          meta.aiConfig = nextAiConfig;
+          metaChanged = true;
+        }
       }
 
-      data.chats = data.chats || {};
-
-      const previousChat = data.chats[body.chatId] || {};
+      const previousChat = meta.chats[body.chatId] || {};
       const autoReply = body.autoReply || previousChat.autoReply || {
         enabled: false
       };
@@ -375,40 +593,41 @@ export class BackgroundBackend {
           String(body.chatStatusRegex || '').slice(0, 500),
         myName:
           body.myName || '用户',
-        requestBody:
-          autoReply.enabled ? (body.requestBody || previousChat.requestBody || null) : null,
         autoReply,
         lastUserMessageAt: autoReply.enabled
           ? Date.now()
           : Number(previousChat.lastUserMessageAt || 0),
         appUrl:
-          body.appUrl || './'
+          body.appUrl || './',
+        bodyParts: previousChat.bodyParts || 0,
+        bodyRev: previousChat.bodyRev || 0
       };
 
-      // A normal manual AI reply does not need its full prompt history stored
-      // in the Worker. Keep that context only for chats using Worker auto-reply,
-      // and avoid a Durable Object write when the synchronized state is equal.
-      if (JSON.stringify(previousChat) !== JSON.stringify(nextChat)) {
-        data.chats[body.chatId] = nextChat;
-        await this.save(data);
+      // 只有开了 Worker 自动回复的聊天才需要保存请求内容（并裁剪体积）；
+      // 普通回复不需要，关闭自动回复时顺便清掉。
+      if (autoReply.enabled) {
+        if (body.requestBody) {
+          const parts = await this.putBig(bodyKey(body.chatId), trimAutoReplyBody(body.requestBody));
+          if (parts < nextChat.bodyParts) {
+            const keys = Array.from({ length: nextChat.bodyParts - parts }, (_, i) => `${bodyKey(body.chatId)}:${parts + i}`);
+            await this.state.storage.delete(keys);
+          }
+          nextChat.bodyParts = parts;
+          nextChat.bodyRev = (previousChat.bodyRev || 0) + 1;
+        }
+      } else if (nextChat.bodyParts > 0) {
+        await this.deleteBig(bodyKey(body.chatId), nextChat.bodyParts);
+        nextChat.bodyParts = 0;
+        nextChat.bodyRev = (previousChat.bodyRev || 0) + 1;
       }
 
-      const times = Object.values(
-        data.chats
-      )
-        .filter(
-          chat =>
-            chat.autoReply?.enabled && chat.requestBody
-        )
-        .map(chat => {
-          const lastActivityAt = latestTimestamp(
-            chat.autoReply.lastTriggerTime,
-            chat.lastUserMessageAt
-          ) || Date.now();
-          return lastActivityAt + autoReplyIntervalMs(chat.autoReply.interval);
-        });
+      if (JSON.stringify(previousChat) !== JSON.stringify(nextChat)) {
+        meta.chats[body.chatId] = nextChat;
+        metaChanged = true;
+      }
+      if (metaChanged) await this.saveMeta(meta);
 
-      await this.setAlarmIfChanged(times.length ? Math.min(...times) : null);
+      await this.setAlarmIfChanged(computeNextAlarm(meta));
 
       return json({ ok: true });
     }
@@ -418,27 +637,31 @@ export class BackgroundBackend {
       request.method === 'POST'
     ) {
       const body = await request.json();
-      const data = await this.load();
+      const meta = await this.loadMeta();
 
       const proactiveSettings = body.chats || {};
-      if (JSON.stringify(data.proactive || {}) !== JSON.stringify(proactiveSettings)) {
-        data.proactive = proactiveSettings;
-        await this.save(data);
+      if (JSON.stringify(meta.proactive || {}) !== JSON.stringify(proactiveSettings)) {
+        meta.proactive = proactiveSettings;
+        await this.saveMeta(meta);
       }
 
       return json({ ok: true });
     }
 
     if (url.pathname === '/v1/backend/disable' && request.method === 'POST') {
-      const data = await this.load();
-      let changed = Object.keys(data.proactive || {}).length > 0;
-      data.proactive = {};
-      for (const chat of Object.values(data.chats || {})) {
-        if (chat.autoReply?.enabled || chat.requestBody) changed = true;
+      const meta = await this.loadMeta();
+      let changed = Object.keys(meta.proactive || {}).length > 0;
+      meta.proactive = {};
+      for (const [chatId, chat] of Object.entries(meta.chats)) {
+        if (chat.autoReply?.enabled || chat.bodyParts > 0) changed = true;
         if (chat.autoReply) chat.autoReply.enabled = false;
-        chat.requestBody = null;
+        if (chat.bodyParts > 0) {
+          await this.deleteBig(bodyKey(chatId), chat.bodyParts);
+          chat.bodyParts = 0;
+          chat.bodyRev = (chat.bodyRev || 0) + 1;
+        }
       }
-      if (changed) await this.save(data);
+      if (changed) await this.saveMeta(meta);
       await this.setAlarmIfChanged(null);
       return json({ ok: true, stopped: true });
     }
@@ -448,7 +671,7 @@ export class BackgroundBackend {
       request.method === 'POST'
     ) {
       const body = await request.json();
-      const data = await this.load();
+      const meta = await this.loadMeta();
 
       // 每次请求都同步最新的 API 设置，支持用户随时切换 API。
       if (
@@ -456,7 +679,7 @@ export class BackgroundBackend {
         body.aiConfig?.key &&
         body.aiConfig?.model
       ) {
-        data.aiConfig = {
+        meta.aiConfig = {
           provider: String(
             body.aiConfig.provider ||
               'newapi'
@@ -472,13 +695,13 @@ export class BackgroundBackend {
           ).trim()
         };
 
-        await this.save(data);
+        await this.saveMeta(meta);
       }
 
       if (
-        !data.aiConfig?.url ||
-        !data.aiConfig?.key ||
-        !data.aiConfig?.model
+        !meta.aiConfig?.url ||
+        !meta.aiConfig?.key ||
+        !meta.aiConfig?.model
       ) {
         return json(
           {
@@ -490,7 +713,7 @@ export class BackgroundBackend {
       }
 
       const response = await callAI(
-        data.aiConfig,
+        meta.aiConfig,
         body.requestBody || {}
       );
 
@@ -508,14 +731,15 @@ export class BackgroundBackend {
   }
 
   async alarm() {
-    const data = await this.load();
+    const meta = await this.loadMeta();
     const now = Date.now();
-    let nextAlarm = 0;
-    let stateChanged = false;
+    // 每个到期聊天的处理结果。AI 调用和推送要等很久，期间别的请求可能已改过 meta，
+    // 所以结果先收集起来，最后重新读取 meta 再合并，避免用旧数据覆盖新数据。
+    const results = [];
 
     for (
       const [chatId, chat] of Object.entries(
-        data.chats || {}
+        meta.chats
       )
     ) {
       const ar = chat.autoReply;
@@ -523,7 +747,7 @@ export class BackgroundBackend {
       if (
         !ar ||
         !ar.enabled ||
-        !chat.requestBody
+        !(chat.bodyParts > 0)
       ) {
         continue;
       }
@@ -535,130 +759,141 @@ export class BackgroundBackend {
       const dueAt =
         last + interval;
 
-      if (dueAt <= now) {
-        try {
-          if (
-            !data.aiConfig?.url ||
-            !data.aiConfig?.key ||
-            !data.aiConfig?.model
-          ) {
-            console.warn(
-              '[BackgroundBackend] 未配置 AI API，跳过主动消息'
-            );
-          } else {
-            const body =
-              JSON.parse(
-                JSON.stringify(
-                  chat.requestBody
-                )
-              );
+      if (dueAt > now) continue;
 
-            body.stream = false;
+      const result = {
+        chatId,
+        bodyRev: chat.bodyRev || 0,
+        newBodyParts: 0,
+        message: null,
+        removed: new Set()
+      };
+      results.push(result);
 
-            if (
-              !Array.isArray(
-                body.messages
-              )
-            ) {
-              continue;
-            }
+      try {
+        if (
+          !meta.aiConfig?.url ||
+          !meta.aiConfig?.key ||
+          !meta.aiConfig?.model
+        ) {
+          console.warn(
+            '[BackgroundBackend] 未配置 AI API，跳过主动消息'
+          );
+        } else {
+          const body = await this.getBig(bodyKey(chatId), chat.bodyParts);
 
+          // 不能 continue：那样会跳过「更新触发时间」和「排下一次 alarm」，
+          // 这个聊天就再也不会被排程，主动消息会悄悄停掉。
+          // 抛出错误交给下方 catch 记录，然后照常排下一次。
+          if (!body || !Array.isArray(body.messages)) {
+            throw new Error('requestBody.messages 格式无效，已跳过本次主动消息');
+          }
+
+          body.stream = false;
+
+          body.messages.push({
+            role: 'user',
+            content:
+              `[系统通知：我已经有一段时间没有和你互动了，请以${chat.realName || '角色'}的身份主动延续之前的对话、发起新话题，或对时间流逝做出反应。]`
+          });
+
+          const response = await callAI(meta.aiConfig, body);
+
+          const text =
+            response
+              ?.choices?.[0]
+              ?.message
+              ?.content || '';
+
+          if (text) {
             body.messages.push({
-              role: 'user',
-              content:
-                `[系统通知：我已经有一段时间没有和你互动了，请以${chat.realName || '角色'}的身份主动延续之前的对话、发起新话题，或对时间流逝做出反应。]`
+              role: 'assistant',
+              content: text
             });
 
-            const response =
-              await callAI(
-                data.aiConfig,
-                body
-              );
+            // 保存裁剪后的对话，历史不会无限变长。
+            result.newBody = trimAutoReplyBody(body);
 
-            const text =
-              response
-                ?.choices?.[0]
-                ?.message
-                ?.content || '';
+            result.message = {
+              id:
+                `background_${Date.now()}_${Math.random()
+                  .toString(36)
+                  .slice(2, 8)}`,
+              chatId,
+              chatType:
+                chat.chatType ||
+                'private',
+              role: 'assistant',
+              content: text,
+              timestamp: now
+            };
 
-            if (text) {
-              body.messages.push({
-                role: 'assistant',
-                content: text
-              });
-
-              chat.requestBody = body;
-
-              chat.autoReply.lastTriggerTime =
-                now;
-
-              data.pendingMessages =
-                data.pendingMessages || [];
-
-              data.pendingMessages.push({
-                id:
-                  `background_${Date.now()}_${Math.random()
-                    .toString(36)
-                    .slice(2, 8)}`,
+            const notificationMessages = splitNotificationMessages(text, chat.statusRegex || '');
+            result.removed = await this.pushAll(
+              meta.subscriptions,
+              notificationMessages.map((notificationText, index) => ({
+                title: chat.remarkName || chat.realName || '新消息',
+                body: notificationText,
+                tag: `uwu-${chatId}-${now}-${index}`,
                 chatId,
-                chatType:
-                  chat.chatType ||
-                  'private',
-                role: 'assistant',
-                content: text,
-                timestamp: now
-              });
-
-              if (
-                data.pendingMessages
-                  .length > 100
-              ) {
-                data.pendingMessages =
-                  data.pendingMessages.slice(
-                    -100
-                  );
-              }
-
-              const notificationMessages = splitNotificationMessages(text, chat.statusRegex || '');
-              for (let index = 0; index < notificationMessages.length; index++) {
-                if (index > 0) await new Promise(resolve => setTimeout(resolve, 350));
-                data.subscriptions = await sendToAll(this.env, data.subscriptions || [], {
-                  title: chat.remarkName || chat.realName || '新消息',
-                  body: notificationMessages[index],
-                  tag: `uwu-${chatId}-${now}-${index}`,
-                  chatId,
-                  chatType: chat.chatType || 'private',
-                  url: chat.appUrl || './'
-                });
-              }
-            }
+                chatType: chat.chatType || 'private',
+                url: chat.appUrl || './'
+              }))
+            );
           }
-        } catch (error) {
-          console.error(
-            '[BackgroundBackend] 主动消息失败',
-            chatId,
-            error
-          );
         }
-
-        ar.lastTriggerTime = now;
-        stateChanged = true;
-      }
-
-      // Use the same latest activity timestamp as dueAt. Using only the older
-      // lastTriggerTime here can schedule an already-expired alarm repeatedly.
-      const next = (latestTimestamp(ar.lastTriggerTime, chat.lastUserMessageAt) || now) + interval;
-
-      if (
-        !nextAlarm ||
-        next < nextAlarm
-      ) {
-        nextAlarm = next;
+      } catch (error) {
+        console.error(
+          '[BackgroundBackend] 主动消息失败',
+          chatId,
+          error
+        );
       }
     }
 
-    if (stateChanged) await this.save(data);
-    await this.setAlarmIfChanged(nextAlarm || null);
+    if (results.length) {
+      const fresh = await this.loadMeta();
+      let changed = false;
+      const removed = new Set();
+
+      for (const result of results) {
+        const freshChat = fresh.chats[result.chatId];
+        if (!freshChat) continue;
+
+        // 保存对话内容。若期间用户又同步过（bodyRev 变了），以用户最新的为准，不覆盖。
+        if (result.newBody && (freshChat.bodyRev || 0) === result.bodyRev && freshChat.autoReply?.enabled) {
+          try {
+            const parts = await this.putBig(bodyKey(result.chatId), result.newBody);
+            if (parts < (freshChat.bodyParts || 0)) {
+              const keys = Array.from({ length: freshChat.bodyParts - parts }, (_, i) => `${bodyKey(result.chatId)}:${parts + i}`);
+              await this.state.storage.delete(keys);
+            }
+            freshChat.bodyParts = parts;
+            freshChat.bodyRev = result.bodyRev + 1;
+          } catch (error) {
+            console.error('[BackgroundBackend] 保存主动消息对话失败', result.chatId, error);
+          }
+        }
+
+        if (freshChat.autoReply) freshChat.autoReply.lastTriggerTime = now;
+        if (result.message) {
+          fresh.pendingMessages.push(result.message);
+          fresh.pendingMessages = limitPendingMessages(fresh.pendingMessages);
+        }
+        for (const endpoint of result.removed) removed.add(endpoint);
+        changed = true;
+      }
+
+      if (removed.size) {
+        fresh.subscriptions = fresh.subscriptions.filter(item => !removed.has(subscriptionEndpoint(item)));
+        changed = true;
+      }
+      if (changed) await this.saveMeta(fresh);
+      await this.setAlarmIfChanged(computeNextAlarm(fresh, now));
+      return;
+    }
+
+    await this.setAlarmIfChanged(computeNextAlarm(meta, now));
   }
 }
 
