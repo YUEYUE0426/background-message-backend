@@ -422,6 +422,8 @@ export class BackgroundBackend {
       const body = await request.json();
       const job = await this.state.storage.get(jobKey(body.jobId));
       if (!job) return json({ error: 'Job not found' }, 404);
+      // 用户已取消：丢弃结果，不保存回复、不推送通知。
+      if (job.status === 'cancelled') return json({ ok: true, cancelled: true });
       const requestParts = job.reqParts || 0;
       job.status = body.error ? 'failed' : 'completed';
       job.updatedAt = Date.now();
@@ -453,6 +455,24 @@ export class BackgroundBackend {
         })));
         await this.removeSubscriptions(removed);
       }
+      return json({ ok: true });
+    }
+
+    if (url.pathname === '/__internal/jobs/cancel' && request.method === 'POST') {
+      const body = await request.json();
+      const meta = await this.loadMeta();
+      const job = await this.state.storage.get(jobKey(body.jobId));
+      const reqParts = job?.reqParts || 0;
+      // 任务可能还没送达（留下已取消标记），也可能排队中/处理中/已完成但 App 还没拿到。
+      const next = { ...(job || {}), jobId: body.jobId, status: 'cancelled', updatedAt: Date.now(), reqParts: 0 };
+      delete next.aiConfig;
+      delete next.response;
+      await this.state.storage.put(jobKey(body.jobId), next);
+      if (reqParts) await this.deleteBig(jobRequestKey(body.jobId), reqParts);
+      meta.jobs[body.jobId] = meta.jobs[body.jobId] || next.updatedAt;
+      const remaining = meta.pendingMessages.filter(item => item.id !== body.jobId);
+      if (remaining.length !== meta.pendingMessages.length) meta.pendingMessages = remaining;
+      await this.saveMeta(meta);
       return json({ ok: true });
     }
 
@@ -1429,6 +1449,13 @@ export default {
       if (!userId) return json({ error: '缺少 userId' }, 400);
       const stub = env.BACKGROUND_BACKEND.get(env.BACKGROUND_BACKEND.idFromName(String(userId)));
       return stub.fetch(`https://internal/__internal/jobs/read?jobId=${encodeURIComponent(jobMatch[1])}`);
+    }
+    if (jobMatch && request.method === 'POST' && url.searchParams.get('action') === 'cancel') {
+      const body = await request.json();
+      if (!body.userId) return json({ error: '缺少 userId' }, 400);
+      const stub = env.BACKGROUND_BACKEND.get(env.BACKGROUND_BACKEND.idFromName(String(body.userId)));
+      return stub.fetch('https://internal/__internal/jobs/cancel', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobId: jobMatch[1] }) });
     }
     if (jobMatch && request.method === 'POST' && url.searchParams.get('action') === 'ack') {
       const body = await request.json();
