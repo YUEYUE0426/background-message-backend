@@ -13,7 +13,9 @@
 
 ## 部署
 
-此项目可以通过 Cloudflare Deploy to Workers 部署。
+推荐方式：先在 GitHub 上 **Fork** 本仓库，再到 Cloudflare 的 Workers & Pages 中选择 Import a repository，连接**你自己账号下**的这份 Fork。这样作者发布新版本后，你可以在自己的 Fork 页面点击 **Sync fork** 自行决定何时更新，Cloudflare 会随之自动重新部署。
+
+在连接之前，先创建 Queue：`uwu-ai-jobs`（见下文）。
 
 部署完成后，需要在 Cloudflare Worker 的 Settings → Variables and Secrets 中设置：
 
@@ -55,7 +57,7 @@ AI Key 只应存储在自己控制的 Cloudflare Worker 中。
 
 `https://background-message-backend.example.workers.dev`
 
-将该 URL 填入应用的后台消息服务设置。
+将该 URL 填入应用的 Cloudflare 后台消息服务设置。
 
 ## 安全
 
@@ -67,3 +69,12 @@ AI Key 只应存储在自己控制的 Cloudflare Worker 中。
 - VAPID 私钥
 - Cloudflare API Token
 - 其他密码或访问令牌
+
+## 隐私说明
+
+- 本项目不会把你的聊天内容、AI Key、推送订阅等数据发送给作者。Worker 对外只会做两件事：调用你自己设置的 AI 服务商，以及通过 Web Push 向你的设备发送通知。
+- `BACKEND_TOKEN` 相当于总钥匙：拿到它的人可以读取尚未同步的回复、修改 Worker 里的 AI 设置。请使用至少 32 字符的随机值，不要分享、截图或提交到 GitHub；一旦泄露，请立即在 Cloudflare 里更换并在应用里同步修改。
+- 不要公开你的 Worker 地址：即使没有 Token，被拒绝的请求也会占用 Cloudflare 免费额度。
+- 应用导出的备份文件包含 AI Key 和后台 Token（明文），请妥善保管。
+- 若想清除云端数据，删除该 Worker（及其 Durable Object）即可。
+
