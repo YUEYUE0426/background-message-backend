@@ -28,13 +28,37 @@ function autoReplyIntervalMs(value) {
   return Math.max(5, Number.isFinite(minutes) ? minutes : 60) * 60 * 1000;
 }
 
+// 恒定时间比较：不因为前几位相同就更早返回，避免通过响应时间间接猜出 Token。
+function timingSafeEqualText(a, b) {
+  const enc = new TextEncoder();
+  const x = enc.encode(String(a));
+  const y = enc.encode(String(b));
+  const length = Math.max(x.length, y.length);
+  let diff = x.length ^ y.length;
+  for (let i = 0; i < length; i++) {
+    diff |= (x[i] || 0) ^ (y[i] || 0);
+  }
+  return diff === 0;
+}
+
 function checkAuth(request, env) {
   // The API must fail closed: an unset token must never make the Worker public.
   if (typeof env.BACKEND_TOKEN !== 'string' || !env.BACKEND_TOKEN.trim()) return false;
 
   const auth = request.headers.get('Authorization') || '';
 
-  return auth === `Bearer ${env.BACKEND_TOKEN.trim()}`;
+  return timingSafeEqualText(auth, `Bearer ${env.BACKEND_TOKEN.trim()}`);
+}
+
+// 推送通知点击后会打开 appUrl。只接受 https（或本机调试用的 http://localhost）的“站点地址”，
+// 并去掉路径、参数等多余部分，防止 javascript: 之类的地址或带参数的奇怪链接被写进通知。
+function safeAppUrl(value) {
+  try {
+    const u = new URL(String(value || ''));
+    const local = u.hostname === 'localhost' || u.hostname === '127.0.0.1';
+    if (u.protocol === 'https:' || (u.protocol === 'http:' && local)) return u.origin;
+  } catch {}
+  return './';
 }
 
 // ===================== 存储布局（v2）=====================
@@ -384,7 +408,7 @@ export class BackgroundBackend {
         chatId: body.chatId || '', chatType: body.chatType || 'private',
         chatName: String(body.chatName || meta.chats?.[body.chatId]?.remarkName || meta.chats?.[body.chatId]?.realName || '').slice(0, 120),
         chatStatusRegex: String(body.chatStatusRegex || meta.chats?.[body.chatId]?.statusRegex || '').slice(0, 500),
-        appUrl: body.appUrl || './'
+        appUrl: safeAppUrl(body.appUrl)
       });
       meta.jobs[body.jobId] = createdAt;
       await this.saveMeta(meta);
@@ -452,7 +476,7 @@ export class BackgroundBackend {
           title,
           body: text,
           tag: `uwu-${job.jobId || body.jobId}-${index}`,
-          url: job.appUrl,
+          url: safeAppUrl(job.appUrl),
           chatId: job.chatId, chatType: job.chatType
         })));
         await this.removeSubscriptions(removed);
@@ -512,7 +536,7 @@ export class BackgroundBackend {
       if (body.subscription) {
         meta.subscriptions.push({
           subscription: body.subscription,
-          appUrl: body.appUrl || './',
+          appUrl: safeAppUrl(body.appUrl),
           timezone: body.timezone || 'UTC'
         });
       }
@@ -665,7 +689,7 @@ export class BackgroundBackend {
           ? Date.now()
           : Number(previousChat.lastUserMessageAt || 0),
         appUrl:
-          body.appUrl || './',
+          safeAppUrl(body.appUrl),
         bodyParts: previousChat.bodyParts || 0,
         bodyRev: previousChat.bodyRev || 0
       };
@@ -907,7 +931,7 @@ export class BackgroundBackend {
                 tag: `uwu-${chatId}-${now}-${index}`,
                 chatId,
                 chatType: chat.chatType || 'private',
-                url: chat.appUrl || './'
+                url: safeAppUrl(chat.appUrl)
               }))
             );
           }
@@ -1428,7 +1452,7 @@ export default {
           body: JSON.stringify({ jobId, aiConfig: { provider: String(ai.provider || 'newapi'), url: String(ai.url).trim(),
             key: String(ai.key).trim(), model: String(ai.model).trim() }, requestBody: body.requestBody || {},
             chatId: body.chatId || '', chatType: body.chatType || 'private', chatName: body.chatName || '',
-            chatStatusRegex: body.chatStatusRegex || '', appUrl: body.appUrl || './' })
+            chatStatusRegex: body.chatStatusRegex || '', appUrl: safeAppUrl(body.appUrl) })
         });
         if (!saved.ok) throw new Error('无法保存后台任务');
         try {
