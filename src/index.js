@@ -71,6 +71,8 @@ function safeAppUrl(value) {
 //   jobreq:<jobId>:<n>    AI 任务的请求内容（按块存，任务结束就删除）
 // 旧版的 data 会在第一次访问时自动迁移。
 const STORAGE_CHUNK_CHARS = 400000; // 每块字符数，远低于 2 MB（中文按 3 字节算也只有约 1.2 MB）
+const JOB_RATE_PER_MINUTE = 30; // 每分钟最多创建的 AI 任务数
+const MAX_REQUEST_BYTES = 8 * 1024 * 1024; // 单个请求体上限
 const MAX_JOBS = 100; // 最多保留的 AI 任务记录
 const JOB_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 任务记录保留时间
 const MAX_PENDING_MESSAGES = 100; // 未读消息最多条数
@@ -400,6 +402,9 @@ export class BackgroundBackend {
       const body = await request.json();
       if (await this.state.storage.get(jobKey(body.jobId))) return json({ ok: true, existing: true });
       const meta = await this.loadMeta();
+      // 简单限流：每分钟最多创建 JOB_RATE_PER_MINUTE 个 AI 任务，防止 Token 泄露后被疯狂刷任务。
+      const recentJobs = Object.values(meta.jobs || {}).filter(t => Date.now() - Number(t) < 60000).length;
+      if (recentJobs >= JOB_RATE_PER_MINUTE) return json({ error: '请求太频繁，请稍后再试' }, 429);
       await this.pruneJobs(meta);
       const reqParts = await this.putBig(jobRequestKey(body.jobId), body.requestBody || {});
       const createdAt = Date.now();
@@ -622,6 +627,9 @@ export class BackgroundBackend {
         );
       }
 
+      const cfgUrlProblem = checkAiUrl(ai.url);
+      if (cfgUrlProblem) return json({ error: cfgUrlProblem }, 400);
+
       const nextAiConfig = {
         provider: String(
           ai.provider || 'newapi'
@@ -653,7 +661,8 @@ export class BackgroundBackend {
       if (
         body.aiConfig?.url &&
         body.aiConfig?.key &&
-        body.aiConfig?.model
+        body.aiConfig?.model &&
+        !checkAiUrl(body.aiConfig.url)
       ) {
         const nextAiConfig = {
           provider: String(
@@ -991,7 +1000,53 @@ export class BackgroundBackend {
   }
 }
 
-async function callAI(
+// ===== AI 地址校验 / 错误信息脱敏 =====
+// 允许 http/https（兼容各种中转站），但拒绝：带账号密码的地址、本机/内网/链路本地地址。
+// Cloudflare Worker 本来就访问不到用户的局域网，这里只是在 Token 泄露时进一步缩小可被滥用的范围。
+function checkAiUrl(value) {
+  let u;
+  try { u = new URL(String(value || '').trim()); } catch { return 'AI API 地址格式无效'; }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return 'AI API 地址必须以 http:// 或 https:// 开头';
+  if (u.username || u.password) return 'AI API 地址不能包含账号密码';
+  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) {
+    return 'AI API 地址不能指向本机或内网';
+  }
+  const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    if (a === 10 || a === 127 || a === 0 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127)) {
+      return 'AI API 地址不能指向本机或内网';
+    }
+  }
+  if (host.includes(':') && (host === '::1' || host === '::' || /^f[cd]/.test(host) || /^fe[89ab]/.test(host) || host.startsWith('::ffff:'))) {
+    return 'AI API 地址不能指向本机或内网';
+  }
+  return '';
+}
+
+// 错误信息里去掉 API Key 或疑似密钥，避免上游服务商把密钥回显出来时被写进任务记录或返回给调用方。
+function redactSecrets(text, key) {
+  let out = String(text ?? '');
+  const k = String(key || '').trim();
+  if (k.length >= 6) out = out.split(k).join('[已隐藏]');
+  return out
+    .replace(/Bearer\s+[A-Za-z0-9._~+\/=-]{8,}/gi, 'Bearer [已隐藏]')
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}/g, 'sk-[已隐藏]')
+    .replace(/\bAIza[0-9A-Za-z_-]{20,}/g, '[已隐藏]');
+}
+
+async function callAI(aiConfig, requestBody) {
+  try {
+    return await callAIInner(aiConfig, requestBody);
+  } catch (error) {
+    const clean = new Error(redactSecrets(error?.message || String(error), aiConfig?.key));
+    clean.name = error?.name || 'Error';
+    throw clean;
+  }
+}
+
+async function callAIInner(
   aiConfig,
   requestBody
 ) {
@@ -1004,6 +1059,9 @@ async function callAI(
       '尚未同步 AI API 设置'
     );
   }
+
+  const urlProblem = checkAiUrl(aiConfig.url);
+  if (urlProblem) throw new Error(urlProblem);
 
   const rawBase = String(aiConfig.url).trim().replace(/\/$/, '');
   let endpoint = rawBase;
@@ -1414,6 +1472,11 @@ export default {
       );
     }
 
+    // 请求体大小上限（有 Content-Length 时检查）。
+    if (request.method === 'POST' && Number(request.headers.get('Content-Length') || 0) > MAX_REQUEST_BYTES) {
+      return json({ error: '请求内容过大' }, 413);
+    }
+
     if (
       url.pathname ===
       '/v1/health'
@@ -1444,6 +1507,8 @@ export default {
         const body = await request.json();
         const ai = body.aiConfig || {};
         if (!body.userId || !ai.url || !ai.key || !ai.model) return json({ error: '缺少 userId 或 AI API 設定' }, 400);
+        const submitUrlProblem = checkAiUrl(ai.url);
+        if (submitUrlProblem) return json({ error: submitUrlProblem }, 400);
         const jobId = String(body.jobId || crypto.randomUUID());
         if (!/^[a-zA-Z0-9_-]{8,80}$/.test(jobId)) return json({ error: '无效的 jobId' }, 400);
         const stub = env.BACKGROUND_BACKEND.get(env.BACKGROUND_BACKEND.idFromName(String(body.userId)));
@@ -1454,6 +1519,7 @@ export default {
             chatId: body.chatId || '', chatType: body.chatType || 'private', chatName: body.chatName || '',
             chatStatusRegex: body.chatStatusRegex || '', appUrl: safeAppUrl(body.appUrl) })
         });
+        if (saved.status === 429) return json({ error: '请求太频繁，请稍后再试' }, 429);
         if (!saved.ok) throw new Error('无法保存后台任务');
         try {
           await env.AI_QUEUE.send({ userId: String(body.userId), jobId });
