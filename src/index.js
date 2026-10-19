@@ -1349,13 +1349,19 @@ function splitNotificationMessages(text, statusRegex = '') {
     }
   }
 
-  const segments = [...visible.matchAll(/\[([^\]\r\n]+)\]/g)].map(match => match[1].trim());
+  // 按出现顺序取出「方括号消息」和「转发聊天记录」卡片（后者是 <名字转发的聊天记录>…</…> 标签，不是方括号）。
+  const segments = [];
+  for (const match of visible.matchAll(/\[([^\]\r\n]+)\]|<([^<>\s\/]+转发的聊天记录)>[\s\S]*?<\/\2>/g)) {
+    if (match[1] !== undefined) segments.push(match[1].trim());
+    else segments.push('\u0000forward');
+  }
   const messages = [];
   // UwU 认得的消息格式（会显示成聊天气泡）才算「消息」；其它方括号内容（状态栏、动态评论、旁白标记等）
   // UwU 不会显示成气泡，如果也弹通知，就会出现「通知了两次，点进去只有一条」。
   const unknownSegments = [];
   const ignoredRaw = []; // UwU 不会显示的方括号内容，兜底时要从整段文字里去掉
   for (const segment of segments) {
+    if (segment === '\u0000forward') { messages.push('转发了一段聊天记录'); continue; }
     if (/更新状态为|system(?:-display)?\s*:/i.test(segment)) { ignoredRaw.push(`[${segment}]`); continue; }
     if (/已接收礼物|(?:接收|退回).*转账|(?:同意|拒绝).*代付/.test(segment)) { ignoredRaw.push(`[${segment}]`); continue; }
     // UwU 本身不会把这些显示成聊天消息（动态/签名/群通知），也就不该弹系统通知，否则点进去会发现少一条。
@@ -1363,13 +1369,20 @@ function splitNotificationMessages(text, statusRegex = '') {
 
     const payloadMatch = segment.match(/[：:]([\s\S]*)$/);
     const payload = payloadMatch ? payloadMatch[1].trim() : '';
-    if (/的表情包[：:]/.test(segment) && payload) {
+    // 引用消息：模型常把「并回复」写成繁体「並回覆」，引用的内容里也可能带冒号，所以按引号结构取回复内容。
+    const quoteMatch = segment.match(/引用\s*[“"「『][\s\S]*?[”"」』]\s*[并並]?\s*回[复覆復]\s*[：:]\s*([\s\S]*)$/);
+    if (quoteMatch && quoteMatch[1].trim()) {
+      messages.push(quoteMatch[1].trim());
+    } else if (/的表情包[：:]/.test(segment) && payload) {
       messages.push(`发送了表情包：${payload}`);
-    } else if (/的消息[：:]|并回复[：:]|的语音[：:]|发来的(?:照片|视频)(?:\/视频)?[：:]|的转账[：:]|送来的礼物[：:]/.test(segment) && payload) {
+    } else if (/的(?:消息|訊息)[：:]|并回复[：:]|的(?:语音|語音)[：:]|发来的(?:照片|视频|視頻)(?:\/(?:视频|視頻))?[：:]|的[转轉][账賬帳][：:]|送来的礼物[：:]/.test(segment) && payload) {
       messages.push(payload);
     } else if (/撤回了一条消息[：:]/.test(segment) && payload) {
       messages.push(`撤回消息：${payload}`);
     } else if (/向.*发起了(?:视频|语音)通话/.test(segment)) {
+      messages.push(segment.slice(0, 360));
+    } else if (/向.*发起了代付请求|为.*下单了[：:]/.test(segment)) {
+      // 代付请求、主动下单：UwU 会显示成卡片。
       messages.push(segment.slice(0, 360));
     } else if (segment && !/更新状态为/.test(segment)) {
       unknownSegments.push(segment.slice(0, 360));
