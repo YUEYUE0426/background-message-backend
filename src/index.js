@@ -1366,6 +1366,15 @@ function splitNotificationMessages(text, statusRegex = '') {
     if (/已接收礼物|(?:接收|退回).*转账|(?:同意|拒绝).*代付/.test(segment)) { ignoredRaw.push(`[${segment}]`); continue; }
     // UwU 本身不会把这些显示成聊天消息（动态/签名/群通知），也就不该弹系统通知，否则点进去会发现少一条。
     if (/发布了一条(?:带图)?动态|更新了个性签名|邀请.*加入了群聊|修改群名为/.test(segment)) { ignoredRaw.push(`[${segment}]`); continue; }
+    // 拍一拍（不弹通知）和拍一拍后缀设置：UwU 里显示成小字/不显示。
+    if (/^[^：:]{1,40}?拍了拍|更新了?拍一拍后缀为/.test(segment)) { ignoredRaw.push(`[${segment}]`); continue; }
+    // 投票：选择/添加选项只是更新卡片，不弹通知；发起投票弹「发起了投票：标题」。
+    if (/在投票[“"「『].*中(?:选择了|添加了选项)[：:]/.test(segment)) { ignoredRaw.push(`[${segment}]`); continue; }
+    if (/发起了投票[：:]/.test(segment)) {
+      const voteTitle = (segment.match(/发起了投票[：:]\s*([^|｜]*)/) || [])[1] || '';
+      messages.push(`发起了投票：${voteTitle.trim()}`.slice(0, 360));
+      continue;
+    }
 
     const payloadMatch = segment.match(/[：:]([\s\S]*)$/);
     const payload = payloadMatch ? payloadMatch[1].trim() : '';
