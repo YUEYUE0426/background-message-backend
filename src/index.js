@@ -71,6 +71,8 @@ function safeAppUrl(value) {
 //   jobreq:<jobId>:<n>    AI 任务的请求内容（按块存，任务结束就删除）
 // 旧版的 data 会在第一次访问时自动迁移。
 const STORAGE_CHUNK_CHARS = 400000; // 每块字符数，远低于 2 MB（中文按 3 字节算也只有约 1.2 MB）
+// 非聊天类的后台任务（相遇 / 番外）：生成完成后只留在任务里等 App 取回，不写入未读聊天消息，通知也不带正文。
+const JOB_KINDS = ['offline', 'extra'];
 const JOB_RATE_PER_MINUTE = 30; // 每分钟最多创建的 AI 任务数
 const MAX_REQUEST_BYTES = 8 * 1024 * 1024; // 单个请求体上限
 const MAX_JOBS = 100; // 最多保留的 AI 任务记录
@@ -246,7 +248,8 @@ function publicJob(job) {
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     chatId: job.chatId,
-    chatType: job.chatType
+    chatType: job.chatType,
+    kind: job.kind || ''
   };
 }
 
@@ -426,6 +429,7 @@ export class BackgroundBackend {
         chatId: body.chatId || '', chatType: body.chatType || 'private',
         chatName: String(body.chatName || meta.chats?.[body.chatId]?.remarkName || meta.chats?.[body.chatId]?.realName || '').slice(0, 120),
         chatStatusRegex: String(body.chatStatusRegex || meta.chats?.[body.chatId]?.statusRegex || '').slice(0, 500),
+        kind: JOB_KINDS.includes(body.kind) ? body.kind : '',
         appUrl: safeAppUrl(body.appUrl)
       });
       meta.jobs[body.jobId] = createdAt;
@@ -500,7 +504,24 @@ export class BackgroundBackend {
       }
 
       const content = body.error ? '' : body.response?.choices?.[0]?.message?.content;
-      if (content) {
+      if (content && JOB_KINDS.includes(job.kind)) {
+        // 相遇 / 番外：回复留在任务里，由 App 回来后按 jobId 取；只发一条不含正文的提醒。
+        try {
+          const meta = await this.loadMeta();
+          const name = job.chatName || meta.chats?.[job.chatId]?.remarkName || meta.chats?.[job.chatId]?.realName || 'UwU';
+          const removed = await this.pushAll(meta.subscriptions, [{
+            title: name,
+            body: job.kind === 'offline' ? '相遇的故事写好了，点开继续' : '番外生成好了，点开查看',
+            tag: `uwu-${job.kind}-${job.jobId || body.jobId}`,
+            kind: job.kind,
+            url: safeAppUrl(job.appUrl),
+            chatId: job.chatId, chatType: job.chatType
+          }]);
+          await this.removeSubscriptions(removed);
+        } catch (error) {
+          console.warn('[BackgroundBackend] 发送相遇/番外完成提醒出错', error);
+        }
+      } else if (content) {
         // 先保存回复再发 Push，这样从通知点进 App 时可以马上拉到这条消息。
         const meta = await this.loadMeta();
         meta.pendingMessages.push({ id: body.jobId, chatId: job.chatId, chatType: job.chatType,
@@ -625,6 +646,7 @@ export class BackgroundBackend {
         aiModel: meta.aiConfig?.model || '',
         proactiveModel: (pa || meta.aiConfig || {}).model || '',
         usingProactiveApi: !!pa,
+        jobKinds: JOB_KINDS,
         chats
       });
     }
@@ -1757,7 +1779,7 @@ export default {
           body: JSON.stringify({ jobId, aiConfig: { provider: String(ai.provider || 'newapi'), url: String(ai.url).trim(),
             key: String(ai.key).trim(), model: String(ai.model).trim() }, requestBody: body.requestBody || {},
             chatId: body.chatId || '', chatType: body.chatType || 'private', chatName: body.chatName || '',
-            chatStatusRegex: body.chatStatusRegex || '', appUrl: safeAppUrl(body.appUrl) })
+            chatStatusRegex: body.chatStatusRegex || '', kind: String(body.kind || ''), appUrl: safeAppUrl(body.appUrl) })
         });
         if (saved.status === 429) return json({ error: '请求太频繁，请稍后再试' }, 429);
         if (!saved.ok) throw new Error('无法保存后台任务');
