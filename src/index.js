@@ -82,6 +82,10 @@ const MAX_PENDING_CHARS = 600000; // 未读消息总字数上限
 const AUTO_REPLY_MAX_MESSAGES = 80; // 自动回复保留的非 system 消息条数
 const AUTO_REPLY_MAX_CHARS = 400000; // 自动回复请求内容总字数上限
 
+const PHONE_POLL_MS = 60000;
+const PHONE_FRESH_MS = 30 * 60000;
+const PHONE_MIN_GAP = 10 * 60000;
+
 function emptyMeta() {
   return {
     v: 2,
@@ -235,6 +239,11 @@ function computeNextAlarm(meta, now = Date.now()) {
     { const probe = Math.max(at, now); const shifted = skipQuiet(ar.quietHours, probe); if (shifted !== probe) at = shifted; }
     if (!next || at < next) next = at;
   }
+  const pb = meta.phoneBg;
+  if (pb && pb.url && pb.token && pb.chats && Object.keys(pb.chats).some(id => meta.chats?.[id]?.bodyParts > 0)) {
+    const at = Math.max(now + 1000, (pb.lastPoll || 0) + PHONE_POLL_MS);
+    if (!next || at < next) next = at;
+  }
   return next || null;
 }
 
@@ -308,6 +317,7 @@ export class BackgroundBackend {
       const meta = normalizeMeta(stored);
       meta.aiConfig = await openConfig(this.env, meta.aiConfig);
       meta.proactiveAiConfig = await openConfig(this.env, meta.proactiveAiConfig);
+      if (meta.phoneBg && typeof meta.phoneBg === 'object') meta.phoneBg = { ...meta.phoneBg, token: (await openSecret(this.env, meta.phoneBg.token)).value };
       return meta;
     }
     const legacy = await this.state.storage.get('data');
@@ -322,6 +332,7 @@ export class BackgroundBackend {
     toStore.proactiveAiConfig = await sealConfig(this.env, meta.proactiveAiConfig);
     delete toStore.aiConfig?.keyUnreadable;
     delete toStore.proactiveAiConfig?.keyUnreadable;
+    if (meta.phoneBg && typeof meta.phoneBg === 'object') toStore.phoneBg = { ...meta.phoneBg, token: await sealSecret(this.env, meta.phoneBg.token) };
     await this.state.storage.put('meta', toStore);
   }
 
@@ -813,10 +824,13 @@ export class BackgroundBackend {
         bodyParts: previousChat.bodyParts || 0,
         bodyRev: previousChat.bodyRev || 0
       };
+      // 后台陪伴：未传该字段时沿用之前的值
+      const phoneBgOn = body.phoneBg === undefined ? !!previousChat.phoneBg : !!body.phoneBg;
+      if (phoneBgOn) nextChat.phoneBg = true;
 
       // 只有开了 Worker 自动回复的聊天才需要保存请求内容（并裁剪体积）；
       // 普通回复不需要，关闭自动回复时顺便清掉。
-      if (autoReply.enabled) {
+      if (autoReply.enabled || phoneBgOn) {
         if (body.requestBody) {
           const parts = await this.putBig(bodyKey(body.chatId), trimAutoReplyBody(body.requestBody));
           if (parts < nextChat.bodyParts) {
@@ -859,11 +873,61 @@ export class BackgroundBackend {
       return json({ ok: true });
     }
 
+    if (url.pathname === '/v1/phone/sync' && request.method === 'POST') {
+      const body = await request.json();
+      const meta = await this.loadMeta();
+      const chats = body.chats && typeof body.chats === 'object' ? body.chats : {};
+      const ids = Object.keys(chats).slice(0, 50);
+      if (!ids.length) {
+        if (meta.phoneBg) { meta.phoneBg = null; await this.saveMeta(meta); }
+        for (const chat of Object.values(meta.chats)) { if (chat.phoneBg) { chat.phoneBg = false; } }
+        await this.saveMeta(meta);
+        await this.setAlarmIfChanged(computeNextAlarm(meta));
+        return json({ ok: true, enabled: false });
+      }
+      const phoneUrl = String(body.url || '').trim().replace(/\/+$/, '');
+      const phoneToken = String(body.token || '').trim();
+      const bad = !phoneToken ? '缺少手机状态密钥' : (/^https:\/\//i.test(phoneUrl) ? checkAiUrl(phoneUrl) : '手机状态 Worker 地址必须以 https:// 开头');
+      if (bad) return json({ ok: false, error: bad }, 400);
+      const prev = meta.phoneBg || {};
+      const state = prev.state && typeof prev.state === 'object' ? prev.state : {};
+      const nextChats = {};
+      for (const id of ids) {
+        const c = chats[id] || {};
+        nextChats[id] = {
+          myName: String(c.myName || '用户').slice(0, 40),
+          tz: String(c.tz || 'UTC').slice(0, 60),
+          share: c.share || {}, remind: c.remind || {}, apps: c.apps || {}, appList: Array.isArray(c.appList) ? c.appList.slice(0, 40).map(x => String(x).slice(0, 40)) : [],
+          quiet: c.quiet || { on: false }, cooldown: Number(c.cooldown) >= 0 ? Number(c.cooldown) : 30,
+          awayDelay: Number(c.awayDelay) >= 0 ? Number(c.awayDelay) : 5, lowAt: Number(c.lowAt) > 0 ? Number(c.lowAt) : 20,
+          appMin: Number(c.appMin) > 0 ? Number(c.appMin) : 30
+        };
+      }
+      for (const id of Object.keys(state)) if (!nextChats[id]) delete state[id];
+      meta.phoneBg = { url: phoneUrl, token: phoneToken, chats: nextChats, state, lastPoll: prev.lastPoll || 0, lastError: '' };
+      for (const [id, chat] of Object.entries(meta.chats)) { if (chat.phoneBg && !nextChats[id]) chat.phoneBg = false; }
+      // 立刻试连一次，让 UwU 能马上看到结果
+      let error = '';
+      try { await phoneFetchState(meta.phoneBg); } catch (e) { error = String(e?.message || e).slice(0, 200); }
+      meta.phoneBg.lastError = error;
+      await this.saveMeta(meta);
+      await this.setAlarmIfChanged(computeNextAlarm(meta));
+      return json({ ok: !error, error, enabled: true });
+    }
+
+    if (url.pathname === '/v1/phone/status' && request.method === 'GET') {
+      const meta = await this.loadMeta();
+      const pb = meta.phoneBg;
+      return json({ ok: true, enabled: !!(pb && pb.url), lastPoll: pb?.lastPoll || 0, lastError: pb?.lastError || '', lastFired: pb?.lastFired || null });
+    }
+
     if (url.pathname === '/v1/backend/disable' && request.method === 'POST') {
       const meta = await this.loadMeta();
       let changed = Object.keys(meta.proactive || {}).length > 0;
       meta.proactive = {};
+      if (meta.phoneBg) { meta.phoneBg = null; changed = true; }
       for (const [chatId, chat] of Object.entries(meta.chats)) {
+        if (chat.phoneBg) { delete chat.phoneBg; changed = true; }
         if (chat.autoReply?.enabled || chat.bodyParts > 0) changed = true;
         if (chat.autoReply) chat.autoReply.enabled = false;
         if (chat.bodyParts > 0) {
@@ -941,7 +1005,118 @@ export class BackgroundBackend {
     );
   }
 
+  // ---------- 手机状态：后台陪伴 ----------
+  // 轮询手机状态 Worker 的 /state，按 UwU 同步过来的规则判断要不要让角色主动开口。
+  async phoneTick(now) {
+    const meta0 = await this.loadMeta();
+    const pb0 = meta0.phoneBg;
+    if (!pb0 || !pb0.url || !pb0.token) return;
+    const ids = Object.keys(pb0.chats || {}).filter(id => meta0.chats[id] && meta0.chats[id].bodyParts > 0);
+    if (!ids.length) return;
+    if (now - (pb0.lastPoll || 0) < PHONE_POLL_MS - 5000) return;
+
+    let st = null;
+    let pollError = '';
+    try { st = await phoneFetchState(pb0); } catch (e) { pollError = String(e?.message || e).slice(0, 200); }
+
+    const stateNew = JSON.parse(JSON.stringify(pb0.state || {}));
+    const results = [];
+    if (st) {
+      for (const chatId of ids) {
+        const c = pb0.chats[chatId];
+        const chat = meta0.chats[chatId];
+        const S = stateNew[chatId] || (stateNew[chatId] = {});
+        if (S.seen === undefined) { S.seen = st.seq || 0; continue; }
+        const pick = phonePick(c, S, st, now);
+        if (!pick) continue;
+        S.lastProactive = now;
+        if (pick.kind === 'app') S.lastApp = now;
+        const result = { chatId, bodyRev: chat.bodyRev || 0, message: null, removed: new Set(), reason: pick.d };
+        results.push(result);
+        try {
+          const ai = (meta0.proactiveAiConfig?.url && meta0.proactiveAiConfig?.key && meta0.proactiveAiConfig?.model) ? meta0.proactiveAiConfig : meta0.aiConfig;
+          if (!ai?.url || !ai?.key || !ai?.model) {
+            result.error = (ai?.keyUnreadable || meta0.aiConfig?.keyUnreadable) ? KEY_UNREADABLE_MESSAGE : '后台没有 AI API 设置，请在 UwU 保存一次 API 设置';
+            continue;
+          }
+          const body = await this.getBig(bodyKey(chatId), chat.bodyParts);
+          if (!body || !Array.isArray(body.messages)) throw new Error('requestBody.messages 格式无效');
+          body.stream = false;
+          body.model = ai.model;
+          const M = c.myName || '用户';
+          const snap = phoneDescribe(c, st, now);
+          body.messages.push({
+            role: 'user',
+            content: `[system: 手机状态同步：${M}${pick.d}（${phoneHHMM(c.tz, pick.t)}）。现在由你主动对${M}说话：用自己的口吻自然地回应这件事，一两句即可，可以结合刚才的聊天氛围和你的性格，关心、提醒或调侃一下；不要逐项播报数据。你是真的看得到对方的手机状态，如果对方问起你怎么知道，就坦然说是你看到的，不要说是猜的。如果这和刚才聊天的氛围不搭，就顺着当前话题带过。${snap ? '\n当前手机状态（实时）：\n' + snap : ''}]`
+          });
+          const response = await callAI(ai, body);
+          const text = response?.choices?.[0]?.message?.content || '';
+          if (!text) continue;
+          body.messages.push({ role: 'assistant', content: text });
+          result.newBody = trimAutoReplyBody(body);
+          result.message = {
+            id: `background_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            chatId,
+            chatType: chat.chatType || 'private',
+            role: 'assistant',
+            content: text,
+            timestamp: now
+          };
+          const parts = splitNotificationMessages(text, chat.statusRegex || '');
+          result.removed = await this.pushAll(
+            meta0.subscriptions,
+            parts.map((t, index) => ({
+              title: chat.remarkName || chat.realName || '新消息',
+              body: t,
+              tag: `uwu-${chatId}-${now}-${index}`,
+              chatId,
+              chatType: chat.chatType || 'private',
+              url: safeAppUrl(chat.appUrl)
+            }))
+          );
+        } catch (error) {
+          console.error('[BackgroundBackend] 手机状态主动消息失败', chatId, error);
+          result.error = redactSecrets(String(error?.message || error || '未知错误'), (meta0.proactiveAiConfig?.key || meta0.aiConfig?.key)).slice(0, 300);
+        }
+      }
+    }
+
+    const fresh = await this.loadMeta();
+    if (!fresh.phoneBg) return;
+    fresh.phoneBg.lastPoll = now;
+    fresh.phoneBg.lastError = pollError;
+    fresh.phoneBg.state = fresh.phoneBg.state && typeof fresh.phoneBg.state === 'object' ? fresh.phoneBg.state : {};
+    for (const id of Object.keys(fresh.phoneBg.chats || {})) if (stateNew[id]) fresh.phoneBg.state[id] = stateNew[id];
+    const removed = new Set();
+    for (const result of results) {
+      const freshChat = fresh.chats[result.chatId];
+      if (!freshChat) continue;
+      if (result.newBody && (freshChat.bodyRev || 0) === result.bodyRev) {
+        try {
+          const parts = await this.putBig(bodyKey(result.chatId), result.newBody);
+          if (parts < (freshChat.bodyParts || 0)) {
+            const keys = Array.from({ length: freshChat.bodyParts - parts }, (_, i) => `${bodyKey(result.chatId)}:${parts + i}`);
+            await this.state.storage.delete(keys);
+          }
+          freshChat.bodyParts = parts;
+          freshChat.bodyRev = result.bodyRev + 1;
+        } catch (error) {
+          console.error('[BackgroundBackend] 保存手机状态对话失败', result.chatId, error);
+        }
+      }
+      if (result.message) {
+        fresh.pendingMessages.push(result.message);
+        fresh.pendingMessages = limitPendingMessages(fresh.pendingMessages);
+      }
+      fresh.phoneBg.lastFired = { at: now, chatId: result.chatId, reason: result.reason, ok: !!result.message, error: result.error || '' };
+      for (const endpoint of result.removed) removed.add(endpoint);
+    }
+    if (removed.size) fresh.subscriptions = fresh.subscriptions.filter(item => !removed.has(subscriptionEndpoint(item)));
+    await this.saveMeta(fresh);
+  }
+
   async alarm() {
+    try { await this.phoneTick(Date.now()); } catch (error) { console.error('[BackgroundBackend] 手机状态轮询失败', error); }
     const meta = await this.loadMeta();
     const now = Date.now();
     // 每个到期聊天的处理结果。AI 调用和推送要等很久，期间别的请求可能已改过 meta，
@@ -1156,6 +1331,122 @@ export class BackgroundBackend {
 
     await this.setAlarmIfChanged(computeNextAlarm(meta, now));
   }
+}
+
+// ===== 手机状态：后台陪伴的规则（与 UwU 前台的 phone_status.js 保持一致） =====
+async function phoneFetchState(pb) {
+  const res = await fetch(`${pb.url}/state`, { headers: { Authorization: `Bearer ${pb.token}` }, signal: AbortSignal.timeout(8000), cache: 'no-store' });
+  if (res.status === 401) throw new Error('手机状态 Worker 的密钥不对');
+  if (!res.ok) throw new Error(`手机状态 Worker 返回了 ${res.status}`);
+  let st;
+  try { st = await res.json(); } catch { throw new Error('手机状态 Worker 返回的不是 JSON'); }
+  if (!st || st.ok === false) throw new Error('手机状态 Worker 返回了错误');
+  return st;
+}
+
+function phoneHHMM(tz, t) {
+  const m = localMinutes(tz || 'UTC', t);
+  return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+}
+
+function phoneToMin(v) {
+  const a = String(v || '0:0').split(':');
+  return (parseInt(a[0], 10) || 0) * 60 + (parseInt(a[1], 10) || 0);
+}
+
+function phoneInQuiet(c, t) {
+  const q = c.quiet;
+  if (!q || !q.on) return false;
+  const m = localMinutes(c.tz || 'UTC', t), f = phoneToMin(q.from), to = phoneToMin(q.to);
+  if (f === to) return false;
+  return f < to ? (m >= f && m < to) : (m >= f || m < to);
+}
+
+function phoneCanon(c, name) {
+  const k = String(name || '').toLowerCase();
+  return (c.appList || []).find(a => a.toLowerCase() === k) || null;
+}
+
+function phoneAgo(t, now) {
+  const m = Math.max(0, Math.round((now - t) / 60000));
+  return m < 60 ? `${m} 分钟` : `${Math.floor(m / 60)} 小时${m % 60 ? (m % 60) + ' 分钟' : ''}`;
+}
+
+// 选出这一轮要说的事；没有就返回 null。会更新 S（已读位置、等待离家、用很久的已提醒记录）。
+function phonePick(c, S, st, now) {
+  const share = c.share || {}, R = c.remind || {};
+  const events = Array.isArray(st.events) ? st.events : [];
+  const fresh = events.filter(e => e.id > S.seen);
+  if ((st.seq || 0) > S.seen) S.seen = st.seq;
+  const cands = [];
+  fresh.forEach(e => {
+    if (now - e.t > PHONE_FRESH_MS) return;
+    if (e.type === 'home' && R.home && share.home) cands.push({ t: e.t, kind: 'misc', d: '刚刚到家了' });
+    else if (e.type === 'away' && R.away && share.home) {
+      if (c.awayDelay > 0) S.pendingAway = { id: e.id, t: e.t };
+      else cands.push({ t: e.t, kind: 'misc', d: '刚刚离开家了' });
+    }
+    else if (e.type === 'charge_on' && R.chargeOn && share.charge) cands.push({ t: e.t, kind: 'misc', d: '刚刚开始给手机充电' });
+    else if (e.type === 'charge_off' && R.chargeOff && share.charge) cands.push({ t: e.t, kind: 'misc', d: '刚刚停止给手机充电' });
+    else if (e.type === 'song' && R.song && share.music && e.name) cands.push({ t: e.t, kind: 'now', ev: 'song', d: `刚刚用手机分享了正在听的歌《${e.name}》${e.artist ? '（' + e.artist + '）' : ''}，想让你知道，可以聊聊这首歌` });
+    else if (e.type === 'battery' && R.low && share.battery && e.value <= c.lowAt && (e.prev === undefined || e.prev === null || e.prev > c.lowAt) && st.charging !== true && !(st.chargingSince && st.chargingSince > e.t)) cands.push({ t: e.t, kind: 'misc', d: `手机电量只剩 ${e.value}%，还没有充电` });
+    else if ((e.type === 'app_open' || e.type === 'app_close') && share.apps) {
+      const nm = phoneCanon(c, e.app);
+      if (!nm) return;
+      const a = (c.apps || {})[nm] || {};
+      if (e.type === 'app_open' && a.open) cands.push({ t: e.t, kind: 'app', ev: 'open', app: nm, d: `刚刚打开了「${nm}」` });
+      if (e.type === 'app_close' && a.close) cands.push({ t: e.t, kind: 'app', ev: 'close', app: nm, d: `刚刚关掉了「${nm}」` });
+    }
+  });
+  if (S.pendingAway) {
+    const pa = S.pendingAway;
+    const backHome = st.home === true || events.some(x => x.type === 'home' && x.id > pa.id);
+    if (backHome || !R.away || !share.home || now - pa.t > 90 * 60000) S.pendingAway = null;
+    else if (now - pa.t >= c.awayDelay * 60000) { cands.push({ t: pa.t, kind: 'misc', d: '离开家了' }); S.pendingAway = null; }
+  }
+  // 某个 App 连续开了很久
+  if (share.apps) {
+    S.longFired = S.longFired && typeof S.longFired === 'object' ? S.longFired : {};
+    for (const [name, a] of Object.entries(st.apps || {})) {
+      const nm = phoneCanon(c, name);
+      if (!nm || !a || !a.running || !a.since) continue;
+      if (!((c.apps || {})[nm] || {}).long) continue;
+      if (now - a.since < c.appMin * 60000 || S.longFired[nm] === a.since) continue;
+      cands.push({ t: a.since, kind: 'app', ev: 'long', app: nm, since: a.since, d: `已经连续开着「${nm}」${phoneAgo(a.since, now)}了` });
+    }
+  }
+  const closed = new Set(cands.filter(x => x.ev === 'close').map(x => x.app));
+  let list = cands.filter(x => !((x.ev === 'open' || x.ev === 'long') && closed.has(x.app)));
+  if (!list.length) return null;
+  if (phoneInQuiet(c, now)) list = list.filter(x => x.kind === 'now');
+  if (!list.length) return null;
+  const sinceAny = now - (S.lastProactive || 0), sinceApp = now - (S.lastApp || 0);
+  list = list.filter(x => x.kind === 'now' || (sinceAny >= PHONE_MIN_GAP && (x.kind !== 'app' || sinceApp >= c.cooldown * 60000)));
+  if (!list.length) return null;
+  list.sort((a, b) => a.t - b.t);
+  const pick = list[list.length - 1];
+  if (pick.ev === 'long') S.longFired[pick.app] = pick.since;
+  return pick;
+}
+
+// 当前手机状态的简要描述，附在主动消息里，让角色用的是最新数据。
+function phoneDescribe(c, st, now) {
+  const share = c.share || {}, lines = [];
+  if (share.home && st.home !== null && st.home !== undefined) lines.push(`位置：${st.home ? '在家' : '不在家'}${st.homeSince ? `（${phoneAgo(st.homeSince, now)}前起）` : ''}`);
+  if (share.battery && typeof st.battery === 'number') {
+    const age = st.batteryAt ? now - st.batteryAt : Infinity;
+    lines.push(age < 20 * 60000 ? `手机电量：${st.battery}%` : `手机电量：${phoneAgo(st.batteryAt || now, now)}前记录的是 ${st.battery}%`);
+  }
+  if (share.charge && st.charging !== null && st.charging !== undefined) lines.push(`充电：${st.charging ? '正在充电' : '没有充电'}`);
+  if (share.apps) {
+    for (const [name, a] of Object.entries(st.apps || {})) {
+      const nm = phoneCanon(c, name);
+      if (!nm || !a) continue;
+      if (a.running) lines.push(`${nm}：现在开着${a.since ? `（${phoneHHMM(c.tz, a.since)} 打开，已 ${phoneAgo(a.since, now)}）` : ''}`);
+      else if (a.lastClose && now - a.lastClose < 6 * 3600000) lines.push(`${nm}：已退出（${phoneAgo(a.lastClose, now)}前）`);
+    }
+  }
+  return lines.join('\n');
 }
 
 // ===== AI 地址校验 / 错误信息脱敏 =====
