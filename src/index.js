@@ -1442,8 +1442,17 @@ function phoneDescribe(c, st, now) {
     for (const [name, a] of Object.entries(st.apps || {})) {
       const nm = phoneCanon(c, name);
       if (!nm || !a) continue;
-      if (a.running) lines.push(`${nm}：现在开着${a.since ? `（${phoneHHMM(c.tz, a.since)} 打开，已 ${phoneAgo(a.since, now)}）` : ''}`);
-      else if (a.lastClose && now - a.lastClose < 6 * 3600000) lines.push(`${nm}：已退出（${phoneAgo(a.lastClose, now)}前）`);
+      // 和前台 phone_status.js 一致：这个 App 勾了任何一项提醒，就只在对应的情况让角色知道；一项都没勾才当聊天背景全给
+      //   没勾「打开」：不说「现在开着」（免得角色一看到刚打开就问你找什么）；勾了「用很久」：连续开满 appMin 分钟后才说
+      //   没勾「关闭」：不说「已退出」
+      const fl = (c.apps || {})[nm] || {};
+      const gated = !!(fl.open || fl.close || fl.long);
+      if (a.running) {
+        if (!gated || fl.open) lines.push(`${nm}：现在开着${a.since ? `（${phoneHHMM(c.tz, a.since)} 打开，已 ${phoneAgo(a.since, now)}）` : ''}`);
+        else if (fl.long && a.since && now - a.since >= c.appMin * 60000) lines.push(`${nm}：已经连续开着 ${phoneAgo(a.since, now)}（${phoneHHMM(c.tz, a.since)} 打开）`);
+      } else if (a.lastClose && now - a.lastClose < 6 * 3600000) {
+        if (!gated || fl.close) lines.push(`${nm}：已退出（${phoneAgo(a.lastClose, now)}前）`);
+      }
     }
   }
   return lines.join('\n');
