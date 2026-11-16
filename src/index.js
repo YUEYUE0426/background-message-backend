@@ -1372,6 +1372,62 @@ function phoneAgo(t, now) {
   return m < 60 ? `${m} 分钟` : `${Math.floor(m / 60)} 小时${m % 60 ? (m % 60) + ' 分钟' : ''}`;
 }
 
+// ===== 屏幕使用时间（和前台 phone_status.js 同一套解析）=====
+function phoneParseDurSec(txt) {
+  const s = String(txt || '').trim().replace(/(\d),(?=\d{3}(?!\d))/g, '$1');
+  if (!s) return null;
+  let m = s.match(/^(\d+):(\d{1,2}):(\d{1,2})$/);
+  if (m) return (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]);
+  m = s.match(/^(\d+):(\d{1,2})$/);
+  if (m) return (+m[1]) * 3600 + (+m[2]) * 60;
+  let sec = 0, hit = false, k;
+  const re = /(\d+(?:\.\d+)?)\s*([a-zA-Z一-鿿]+)/g;
+  while ((k = re.exec(s))) {
+    const n = parseFloat(k[1]), u = k[2].toLowerCase();
+    if (/^(h|hr|hrs|hour|hours|小时|小時|时|時|钟头|鐘頭)$/.test(u)) { sec += n * 3600; hit = true; }
+    else if (/^(m|min|mins|minute|minutes|分|分钟|分鐘)$/.test(u)) { sec += n * 60; hit = true; }
+    else if (/^(s|sec|secs|second|seconds|秒|秒钟|秒鐘)$/.test(u)) { sec += n; hit = true; }
+  }
+  if (hit) return Math.round(sec);
+  if (/^\d+(?:\.\d+)?$/.test(s)) return Math.round(parseFloat(s));
+  return null;
+}
+function phoneParseScreen(raw) {
+  const map = {}; let total = null;
+  String(raw || '').split(/\n+/).forEach(line0 => {
+    const line = line0.replace(/^[\s\-•·*]+/, '').trim();
+    if (!line) return;
+    let m = line.match(/^(.*?)\s*[|｜]\s*(.+)$/);
+    if (!m) m = line.match(/^(.*?)\s*[：:]\s*(\d.*)$/);
+    if (!m) m = line.match(/^(.*?\D)\s+(\d.*)$/);
+    if (m && phoneParseDurSec(m[2]) === null) m = null;
+    if (!m) m = line.match(/^(.*?)[\s,，;；\t]+((?:\d+(?:\.\d+)?\s*[a-zA-Z一-鿿]+[\s,，]*)+|\d+:\d{1,2}(?::\d{1,2})?)$/);
+    let name = m ? m[1].trim().replace(/[,，;；]+$/, '') : '', sec = m ? phoneParseDurSec(m[2].replace(/(\d),(?=\d{3}(?!\d))/g, '$1').replace(/[,，]/g, ' ')) : null;
+    if (/^https?:\/\//i.test(name)) { try { name = new URL(name).host || name; } catch { name = name.replace(/^https?:\/\//i, '').split('/')[0]; } }
+    if (!name || sec === null) return;
+    if (/^(总计|總計|合计|合計|总共|總共|全部|total|all\b|屏幕使用时间|螢幕使用時間|screen time)/i.test(name)) { total = Math.max(total || 0, sec); return; }
+    map[name] = (map[name] || 0) + sec;
+  });
+  const items = Object.keys(map).filter(n => map[n] >= 60).map(n => ({ n, s: map[n] })).sort((a, b) => b.s - a.s);
+  return { items, total };
+}
+function phoneFmtDur(ms) {
+  const m = Math.max(0, Math.round(ms / 60000));
+  if (m < 1) return '不到 1 分钟';
+  if (m < 60) return `${m} 分钟`;
+  const h = Math.floor(m / 60), r = m % 60;
+  return r ? `${h} 小时 ${r} 分钟` : `${h} 小时`;
+}
+function phoneScreenLine(sc, tz) {
+  if (!sc || !sc.raw || !sc.at) return '';
+  const p = phoneParseScreen(sc.raw);
+  if (!p.items.length && p.total === null) return '';
+  const parts = [];
+  if (p.total !== null) parts.push(`总计 ${phoneFmtDur(p.total * 1000)}`);
+  if (p.items.length) parts.push(p.items.slice(0, 6).map(x => `${x.n} ${phoneFmtDur(x.s * 1000)}`).join('、'));
+  return `今天屏幕使用时间（${phoneHHMM(tz, sc.at)} 同步的，之后还会增加）：${parts.join('；')}`;
+}
+
 // 选出这一轮要说的事；没有就返回 null。会更新 S（已读位置、等待离家、用很久的已提醒记录）。
 function phonePick(c, S, st, now) {
   const share = c.share || {}, R = c.remind || {};
@@ -1415,6 +1471,16 @@ function phonePick(c, S, st, now) {
       cands.push({ t: a.since, kind: 'app', ev: 'long', app: nm, since: a.since, d: `已经连续开着「${nm}」${phoneAgo(a.since, now)}了` });
     }
   }
+  // 屏幕使用时间：每同步一份新的，就看一眼并主动说一句（刚打开提醒时只记下当前这一份，不立刻说）
+  if (R.screen && share.screen && st.screen && st.screen.at) {
+    const sat = st.screen.at;
+    if (S.screenSeenAt === undefined) S.screenSeenAt = sat;
+    else if (sat > S.screenSeenAt) {
+      const sl = now - sat <= PHONE_FRESH_MS ? phoneScreenLine(st.screen, c.tz) : '';
+      if (sl) cands.push({ t: sat, kind: 'misc', ev: 'screen', since: sat, d: `刚刚同步了屏幕使用时间。${sl}` });
+      else S.screenSeenAt = sat;
+    }
+  }
   const closed = new Set(cands.filter(x => x.ev === 'close').map(x => x.app));
   let list = cands.filter(x => !((x.ev === 'open' || x.ev === 'long') && closed.has(x.app)));
   if (!list.length) return null;
@@ -1426,6 +1492,7 @@ function phonePick(c, S, st, now) {
   list.sort((a, b) => a.t - b.t);
   const pick = list[list.length - 1];
   if (pick.ev === 'long') S.longFired[pick.app] = pick.since;
+  if (pick.ev === 'screen') S.screenSeenAt = pick.since;
   return pick;
 }
 
